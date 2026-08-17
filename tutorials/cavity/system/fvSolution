@@ -1,0 +1,104 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \    /   O peration     | Website:  https://openfoam.org
+    \  /    A nd           | Version:  14
+     \/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// The `solvers`, `SIMPLE` and `relaxationFactors` entries below are read only
+// by the segregated solver (`foamRun -solver incompressibleFluid`), which can
+// be run from this same case directory as a reference.  coupledSimpleFoam
+// reads the `COUPLED` dictionary and nothing else: it applies no
+// under-relaxation to p-U and needs no segregated linear-solver settings.
+
+solvers
+{
+    p
+    {
+        solver          GAMG;
+        tolerance       1e-10;
+        relTol          0.01;
+        smoother        GaussSeidel;
+    }
+
+    "(U|U.*)"
+    {
+        solver          smoothSolver;
+        smoother        symGaussSeidel;
+        tolerance       1e-10;
+        relTol          0.01;
+    }
+}
+
+// ---- segregated reference: foamRun -solver incompressibleFluid ------------
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+
+    pRefCell        0;
+    pRefValue       0;
+
+    residualControl
+    {
+        p               1e-4;
+        U               1e-5;
+    }
+}
+
+relaxationFactors
+{
+    equations
+    {
+        U               0.7;
+    }
+    fields
+    {
+        p               0.3;
+    }
+}
+
+// ---- fully coupled solver: coupledSimpleFoam -----------------------------
+COUPLED
+{
+    // Cap on the coupled outer (Picard) iterations.  This case converges in
+    // 12; the cap only stops a runaway if the setup is perturbed.
+    nOuterIterations    100;
+
+    // Backend for the block-4 linear system:
+    //   SparseLU   Eigen sparse direct, serial      (default in serial)
+    //   BiCGSTAB   Eigen iterative + IncompleteLUT, serial
+    //   PETSc      MATMPIAIJ + KSP, MPI             (default under MPI)
+    // Naming a serial Eigen backend in a parallel run is a fatal error, so
+    // COMMENT THIS KEY OUT before running this case under mpirun - with the
+    // key absent the solver picks the right backend for the run type.  The
+    // three flow-through tutorials leave it out for exactly that reason.
+    linearSolver        SparseLU;
+
+    // Pressure level.  Used only when no pressure patch fixes a value, which
+    // is the situation here: every patch of this cavity is a wall, so the
+    // solver pins the level and prints
+    //     Pressure level: pinned at global cell 0 to p = 0
+    pRefCell            0;
+    pRefValue           0;
+
+    // Pseudo-transient continuation.  Not needed for a laminar cavity.
+    pseudoTransient     no;
+    pseudoCo            200;
+
+    residualControl
+    {
+        U               1e-5;
+        p               1e-4;
+    }
+}
+
+// ************************************************************************* //

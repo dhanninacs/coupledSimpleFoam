@@ -1,0 +1,36 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      topoSetDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Builds the cellSet `fluid` = the whole block minus the fin strips.
+// subsetMesh then keeps `fluid` and moves the newly exposed internal faces
+// onto the `fins` patch declared in blockMeshDict.
+
+actions
+(
+    // the three staggered fin strips
+    { name strips; type cellSet; action new; source boxToCell;
+      boxes ( (0.83333 0.33333 -1)(1.875 0.41667 1)
+              (2.1875 0.58333 -1)(3.22917 0.66667 1)
+              (3.54167 0.33333 -1)(4.58333 0.41667 1) ); }
+
+    // everything, minus the strips, is fluid
+    { name fluid; type cellSet; action new; source boxToCell;
+      box (-10 -10 -10)(10 10 10); }
+
+    { name fluid; type cellSet; action delete; source cellToCell;
+      set strips; }
+);
+
+// ************************************************************************* //

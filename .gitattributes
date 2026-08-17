@@ -1,0 +1,7 @@
+# OpenFOAM sources, dictionaries and shell scripts are LF-only everywhere,
+# including on Windows checkouts.
+* text=auto eol=lf
+
+Allwmake text eol=lf
+Allrun   text eol=lf
+Allclean text eol=lf

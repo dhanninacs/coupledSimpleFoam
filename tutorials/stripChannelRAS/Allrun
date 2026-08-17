@@ -1,0 +1,140 @@
+#!/bin/sh
+#------------------------------------------------------------------------------
+# coupledSimpleFoam tutorial `stripChannelRAS` - mesh, solve and report, in serial.
+#
+# This file is part of coupledSimpleFoam and is distributed under the GNU
+# General Public License version 3; see the LICENSE file at the root of this
+# repository.
+#
+# Usage
+#     ./Allrun               # serial, Eigen SparseLU backend
+#     ./Allrun-parallel      # decomposePar + MPI, PETSc backend
+#
+# Exits non-zero if any step fails, so the script is usable as a regression
+# test.
+#------------------------------------------------------------------------------
+cd "${0%/*}" || exit 1
+
+if [ -z "$WM_PROJECT_DIR" ]
+then
+    echo "$0: the OpenFOAM environment is not set." 1>&2
+    echo "    Source the installation's etc/bashrc first, for example" 1>&2
+    echo "        . /opt/openfoam14/etc/bashrc" 1>&2
+    exit 1
+fi
+
+if ! command -v coupledSimpleFoam > /dev/null 2>&1
+then
+    echo "$0: coupledSimpleFoam is not on PATH." 1>&2
+    echo "    Build it with the repository's ./Allwmake first." 1>&2
+    exit 1
+fi
+
+# OpenFOAM's runApplication skips a step whose log file already exists and
+# swallows the application's exit status.  A tutorial that doubles as a
+# regression test needs neither behaviour, so use these wrappers instead:
+# they always run, and they stop the script on the first failure.
+runApp()
+{
+    _app=$1
+    shift
+    echo "Running $_app on $PWD"
+    if ! "$_app" "$@" > "log.$_app" 2>&1
+    then
+        echo "$0: $_app FAILED; last 20 lines of log.$_app:" 1>&2
+        tail -20 "log.$_app" 1>&2
+        exit 1
+    fi
+}
+
+runPar()
+{
+    _app=$1
+    shift
+    echo "Running $_app in parallel on $PWD using $nProcs processes"
+    if ! mpirun -np "$nProcs" "$_app" -parallel "$@" \
+         < /dev/null > "log.$_app" 2>&1
+    then
+        echo "$0: $_app FAILED; last 20 lines of log.$_app:" 1>&2
+        tail -20 "log.$_app" 1>&2
+        exit 1
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Mesh
+#
+# Two ordering rules here are not optional, and both are far more expensive
+# to rediscover than to write down.
+#
+#  1. `constant/polyMesh/sets` must be deleted after subsetMesh.  topoSet
+#     writes the `strips` and `fluid` cellSets there, subsetMesh renumbers the
+#     mesh underneath them, and decomposePar then aborts with a core dump
+#     while reading the stale sets.
+#
+#  2. The fields live in 0.orig and are copied into 0 only AFTER meshing.
+#     subsetMesh subsets whatever fields it finds in the current time
+#     directory and writes `nan` onto the newly created `fins` patch for
+#     turbulence fields, which kills both decomposePar and the solver with
+#     "wrong token type - expected Scalar, found ... the word 'nan'".
+#     blockMesh, topoSet and subsetMesh need no 0 directory at all.
+#
+# Deleting 0 first also makes the case re-runnable without a fresh checkout.
+#------------------------------------------------------------------------------
+meshCase()
+{
+    rm -rf 0
+
+    runApp blockMesh
+    runApp topoSet
+    runApp subsetMesh -cellSet fluid -patch fins
+
+    rm -rf constant/polyMesh/sets
+
+    cp -r 0.orig 0
+}
+#------------------------------------------------------------------------------
+# Report
+#------------------------------------------------------------------------------
+reportCase()
+{
+    _log=$1
+    _refIters=$2
+    _refP=$3
+
+    if ! grep -q "COUPLED solution converged" "$_log"
+    then
+        echo "$0: the solver did not converge; see $_log" 1>&2
+        exit 1
+    fi
+
+    iters=$(sed -n 's/.*COUPLED solution converged in \([0-9][0-9]*\) iterations.*/\1/p' "$_log")
+    pIn=$(sed -n 's/.*areaAverage(inlet) of p = *//p' log.foamPostProcess | tail -1)
+
+    echo
+    echo "===================================================================="
+    echo "stripChannelRAS - 2-D interrupted-fin channel, Re = 1000, kOmegaSST RAS"
+    echo "--------------------------------------------------------------------"
+    grep -m1 "Pressure level:"     "$_log" | sed 's/^/  /'
+    grep -m1 "Coupled p-U system:" "$_log" | sed 's/^/  /'
+    echo "  Outer iterations to convergence : $iters   (expected $_refIters)"
+    echo "  Inlet-to-outlet pressure drop   : $pIn m^2/s^2   (expected $_refP)"
+    echo "===================================================================="
+
+    [ "$iters" = "$_refIters" ] || \
+        echo "NOTE: iteration count differs from the reference value $_refIters."
+}
+
+meshCase
+
+#------------------------------------------------------------------------------
+# Solve
+#------------------------------------------------------------------------------
+runApp coupledSimpleFoam
+
+runApp foamPostProcess -latestTime \
+    -func "patchAverage(patch=inlet,fields=(p))"
+
+reportCase log.coupledSimpleFoam 146 0.79310179
+
+#------------------------------------------------------------------------------

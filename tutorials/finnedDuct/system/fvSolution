@@ -1,0 +1,70 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// The `solvers`, `SIMPLE` and `relaxationFactors` entries below are read only
+// by the segregated solver (`foamRun -solver incompressibleFluid`), which can
+// be run from this same case directory as a reference.  coupledSimpleFoam
+// reads the `COUPLED` dictionary and nothing else: it applies no
+// under-relaxation to p-U and needs no segregated linear-solver settings.
+
+solvers
+{
+    p { solver GAMG; smoother GaussSeidel; tolerance 1e-08; relTol 0.01; }
+    U { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-07; relTol 0.1; }
+}
+
+// ---- segregated reference: foamRun -solver incompressibleFluid ------------
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+    pRefCell        0;
+    pRefValue       0;
+
+    residualControl { p 1e-4; U 1e-5; }
+}
+
+relaxationFactors
+{
+    equations { U 0.7; }
+    fields    { p 0.3; }
+}
+
+// ---- fully coupled solver: coupledSimpleFoam -----------------------------
+COUPLED
+{
+    // Cap on the coupled outer (Picard) iterations.  This case converges in
+    // 16; the cap only stops a runaway if the setup is perturbed.
+    nOuterIterations 60;
+
+    // No `linearSolver` key on purpose.  With the key absent the solver picks
+    // the Eigen SparseLU direct backend in serial and PETSc under MPI, so this
+    // one case directory runs both ways unchanged.  Naming a serial Eigen
+    // backend (SparseLU, BiCGSTAB) in a parallel run is a fatal error.
+    //
+    // This case is the clearest demonstration of why the backend matters:
+    // sparse-LU fill-in explodes on a 3-D stencil, so the serial direct solve
+    // takes about a minute where four MPI ranks on PETSc take a few seconds.
+
+    // Unused here: `outlet` is a fixedValue pressure patch, so it sets the
+    // level and the solver prints
+    //     Pressure level: set by fixedValue patch outlet
+    pRefCell         0;
+    pRefValue        0;
+
+    residualControl { U 1e-5; p 1e-4; }
+}
+
+// ************************************************************************* //

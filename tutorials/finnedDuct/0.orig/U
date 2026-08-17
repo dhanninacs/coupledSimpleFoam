@@ -1,0 +1,65 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       volVectorField;
+    location    "0";
+    object      U;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+dimensions      [0 1 -1 0 0 0 0];
+
+internalField   uniform (1 0 0);
+
+boundaryField
+{
+    inlet
+    {
+        type            fixedValue;
+        value           uniform (1 0 0);
+    }
+
+    outlet
+    {
+        type            zeroGradient;
+    }
+
+    bottomPlate
+    {
+        type            noSlip;
+    }
+
+    topPlate
+    {
+        type            noSlip;
+    }
+
+    // Constraint patches.  The coupled assembly gives these exactly zero mass
+    // flux: the continuity row and the flux reconstruction treat them like
+    // walls rather than trusting a per-component transform, which would leak
+    // mass through a tilted plane.
+    sideWall_lo
+    {
+        type            symmetry;
+    }
+
+    sideWall_hi
+    {
+        type            symmetry;
+    }
+
+    // Faces created by subsetMesh where the fin cells were removed
+    fins
+    {
+        type            noSlip;
+    }
+}
+
+// ************************************************************************* //

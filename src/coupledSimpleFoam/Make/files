@@ -1,0 +1,13 @@
+#------------------------------------------------------------------------------
+# coupledSimpleFoam - fully coupled steady incompressible p-U solver.
+#
+# Distributed under the GNU General Public License version 3; see the
+# LICENSE file at the root of this repository.
+#------------------------------------------------------------------------------
+
+coupledLinearSystem.C
+eigenCoupledSolver.C
+petscCoupledSolver.C
+coupledSimpleFoam.C
+
+EXE = $(FOAM_USER_APPBIN)/coupledSimpleFoam

@@ -1,0 +1,47 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+convertToMeters 1;
+
+// A plain 2 x 0.5 x 0.375 m duct block.  The fin is cut out of it afterwards
+// by topoSet + subsetMesh; see system/topoSetDict.
+
+vertices
+(
+    (0 0 0)(2 0 0)(2 0.5 0)(0 0.5 0)
+    (0 0 0.375)(2 0 0.375)(2 0.5 0.375)(0 0.5 0.375)
+);
+
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) (64 16 12) simpleGrading (1 1 1)
+);
+
+boundary
+(
+    inlet       { type patch;    faces ( (0 4 7 3) ); }
+    outlet      { type patch;    faces ( (2 6 5 1) ); }
+    bottomPlate { type wall;     faces ( (1 5 4 0) ); }
+    topPlate    { type wall;     faces ( (3 7 6 2) ); }
+    sideWall_lo { type symmetry; faces ( (0 3 2 1) ); }
+    sideWall_hi { type symmetry; faces ( (4 5 6 7) ); }
+
+    // Empty on purpose.  `subsetMesh -patch fins` moves the internal faces
+    // exposed by removing the fin cells onto this patch, which therefore has
+    // to exist beforehand - subsetMesh has nowhere else to put them.
+    fins        { type wall;     faces ( ); }
+);
+
+// ************************************************************************* //

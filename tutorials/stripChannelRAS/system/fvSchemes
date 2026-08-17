@@ -1,0 +1,51 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      fvSchemes;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+ddtSchemes  { default steadyState; }
+gradSchemes { default Gauss linear; }
+
+divSchemes
+{
+    default                        none;
+    div(phi,U)                     bounded Gauss upwind;
+
+    // The turbulence transport equations are solved segregated, by
+    // momentumTransport->correct(), and need their own convection schemes.
+    div(phi,k)                     bounded Gauss upwind;
+    div(phi,omega)                 bounded Gauss upwind;
+
+    // nuEff, not nu: the effective viscosity now carries nut as well
+    div((nuEff*dev2(T(grad(U)))))  Gauss linear;
+
+    // Deferred-correction stress flux of the coupled assembly.  vestigial:
+    // the solver builds this flux itself through a surface integral,
+    // so no scheme entry is needed.  Harmless to keep for foamRun.
+    div(devTauCorrFlux)            Gauss linear;
+}
+
+laplacianSchemes     { default Gauss linear corrected; }
+interpolationSchemes { default linear; }
+snGradSchemes        { default corrected; }
+
+// kOmegaSST needs a wall-distance field.  Without this entry the run fails
+// while the turbulence model is being constructed; with it the solver prints
+//     Selecting patchDistMethod meshWave
+wallDist
+{
+    method meshWave;
+}
+
+// ************************************************************************* //

@@ -1,0 +1,96 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// coupledSimpleFoam solves momentum and continuity as one block system but
+// leaves k and omega to OpenFOAM's own segregated momentumTransport, so the
+// "(k|omega)" entry below IS read by the coupled solver.  The p and U entries,
+// the SIMPLE dictionary and relaxationFactors are read only by the segregated
+// reference run, `foamRun -solver incompressibleFluid`, which can be started
+// from this same case directory.
+
+solvers
+{
+    p { solver GAMG; smoother GaussSeidel; tolerance 1e-08; relTol 0.01; }
+    U { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-07; relTol 0.1; }
+
+    "(k|omega)"
+    {
+        solver    smoothSolver;
+        smoother  symGaussSeidel;
+        tolerance 1e-08;
+        relTol    0.1;
+    }
+}
+
+// ---- segregated reference: foamRun -solver incompressibleFluid ------------
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+    pRefCell        0;
+    pRefValue       0;
+
+    residualControl { p 1e-4; U 1e-5; "(k|omega)" 1e-4; }
+}
+
+relaxationFactors
+{
+    equations { U 0.7; k 0.7; omega 0.7; }
+    fields    { p 0.3; }
+}
+
+// ---- fully coupled solver: coupledSimpleFoam -----------------------------
+COUPLED
+{
+    // A RANS case needs hundreds of coupled outer iterations, not the 25 of
+    // the laminar version of this geometry: the operator itself changes from
+    // iteration to iteration as nut updates, so the outer loop is no longer a
+    // pure Picard iteration on a fixed operator.
+    nOuterIterations 400;
+
+    // Pseudo-transient continuation.  A RANS case is not stable in the
+    // coupled solver without it: it adds a local time-step term to the block
+    // diagonal, sized from pseudoCo, which damps the change in the operator
+    // between outer iterations.
+    pseudoTransient  yes;
+    pseudoCo         200;
+
+    // PETSc KSP controls, used by the parallel backend.  The coupled outer
+    // loop needs the linear system solved essentially exactly for the
+    // iteration count to match the serial direct reference.
+    relTol           1e-8;
+    maxLinearIter    500;
+
+    // No `linearSolver` key on purpose.  With the key absent the solver picks
+    // the Eigen SparseLU direct backend in serial and PETSc under MPI, so this
+    // one case directory runs both ways unchanged.  Naming a serial Eigen
+    // backend (SparseLU, BiCGSTAB) in a parallel run is a fatal error.
+
+    // Unused here: `outlet` is a fixedValue pressure patch, so it sets the
+    // level and the solver prints
+    //     Pressure level: set by fixedValue patch outlet
+    pRefCell         0;
+    pRefValue        0;
+
+    // U and p are the coupled block.  Any other key in this sub-dictionary is
+    // taken to be a segregated (turbulence) field and is checked against
+    // OpenFOAM's own per-iteration residual store, exactly as SIMPLE does, so
+    // the criterion means the same thing in both solvers.  The solver echoes
+    // what it picked up:
+    //     Additional (segregated) residual controls: k 0.0001 omega 0.0001
+    residualControl { U 1e-5; p 1e-4; k 1e-4; omega 1e-4; }
+}
+
+// ************************************************************************* //

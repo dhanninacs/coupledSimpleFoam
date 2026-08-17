@@ -1,0 +1,93 @@
+#!/bin/sh
+#------------------------------------------------------------------------------
+# coupledSimpleFoam - build the solver.
+#
+# This file is part of coupledSimpleFoam and is distributed under the GNU
+# General Public License version 3; see the LICENSE file at the root of this
+# repository.
+#
+# Usage
+#     ./Allwmake [wmake options]
+#
+# Prerequisites
+#     OpenFOAM 14 (openfoam.org), environment sourced
+#     Eigen 3 headers          serial backend, always required
+#     PETSc                    optional, enables the MPI backend
+#
+# Build switches, all environment variables (see doc/INSTALL.md):
+#     COUPLED_NO_PETSC=1   serial Eigen-only build, even if PETSc is installed
+#     PETSC_CUDA=1         link a CUDA-enabled PETSc named by PETSC_DIR and
+#                          PETSC_ARCH (or PETSC_CUDA_DIR / PETSC_CUDA_ARCH)
+#     EIGEN_INC            override the Eigen include flag
+#
+# The executable is installed as $FOAM_USER_APPBIN/coupledSimpleFoam.
+#
+# On WSL, keep the working tree inside the Linux filesystem (for example under
+# the home directory).  Compiling a tree that lives on a mounted Windows drive
+# such as /mnt/c is roughly an order of magnitude slower.
+#------------------------------------------------------------------------------
+cd "${0%/*}" || exit 1
+
+if [ -z "$WM_PROJECT_DIR" ]; then
+    cat 1>&2 <<'EOF'
+Allwmake: the OpenFOAM environment is not set ($WM_PROJECT_DIR is empty).
+
+Source the OpenFOAM etc/bashrc of the local installation first, for example
+
+    . /opt/openfoam14/etc/bashrc
+
+then run ./Allwmake again.
+EOF
+    exit 1
+fi
+
+if [ -z "$FOAM_USER_APPBIN" ]; then
+    echo "Allwmake: FOAM_USER_APPBIN is not set; the OpenFOAM environment" 1>&2
+    echo "          looks incomplete.  Re-source etc/bashrc." 1>&2
+    exit 1
+fi
+
+case "$WM_PROJECT_VERSION" in
+14|14.*) ;;
+*)
+    echo "Allwmake: warning - built against OpenFOAM $WM_PROJECT_VERSION;" 1>&2
+    echo "          this solver targets the OpenFOAM 14 API." 1>&2
+    ;;
+esac
+
+# Advisory only: the include flag itself is applied by Make/options.
+if [ -z "$EIGEN_INC" ] && [ ! -f /usr/include/eigen3/Eigen/Sparse ]; then
+    echo "Allwmake: warning - /usr/include/eigen3/Eigen/Sparse not found." 1>&2
+    echo "          Install the Eigen 3 headers, or point EIGEN_INC at them," 1>&2
+    echo "          e.g. EIGEN_INC=-I/opt/eigen/include ./Allwmake" 1>&2
+fi
+
+echo "coupledSimpleFoam build configuration"
+echo "    OpenFOAM         : $WM_PROJECT_VERSION ($WM_PROJECT_DIR)"
+echo "    Eigen include    : ${EIGEN_INC:--I/usr/include/eigen3 (default)}"
+
+if [ "$COUPLED_NO_PETSC" = 1 ]; then
+    echo "    PETSc backend    : disabled (COUPLED_NO_PETSC=1)"
+elif [ "$PETSC_CUDA" = 1 ]; then
+    echo "    PETSc backend    : CUDA build (PETSC_CUDA=1)"
+    echo "    PETSC_DIR        : ${PETSC_CUDA_DIR:-${PETSC_DIR:-<unset, falling back to a source-build convention>}}"
+    echo "    PETSC_ARCH       : ${PETSC_CUDA_ARCH:-${PETSC_ARCH:-<unset, falling back to a source-build convention>}}"
+elif pkg-config --exists PETSc 2>/dev/null || pkg-config --exists petsc 2>/dev/null
+then
+    echo "    PETSc backend    : enabled (found by pkg-config)"
+else
+    echo "    PETSc backend    : not found by pkg-config, building Eigen-only"
+fi
+echo
+
+wmake "$@" src/coupledSimpleFoam || exit $?
+
+echo
+if [ -x "$FOAM_USER_APPBIN/coupledSimpleFoam" ]; then
+    echo "Built $FOAM_USER_APPBIN/coupledSimpleFoam"
+else
+    echo "Allwmake: wmake reported success but the executable is missing" 1>&2
+    exit 1
+fi
+
+#------------------------------------------------------------------------------

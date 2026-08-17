@@ -1,0 +1,98 @@
+#!/bin/sh
+#------------------------------------------------------------------------------
+# coupledSimpleFoam - remove build artefacts and tutorial run output.
+#
+# This file is part of coupledSimpleFoam and is distributed under the GNU
+# General Public License version 3; see the LICENSE file at the root of this
+# repository.
+#
+# Usage
+#     ./Allclean
+#
+# Removes the wmake object tree for the solver and, for every tutorial, either
+# runs the case's own Allclean or deletes the run output by hand: time
+# directories written by the solver, processor*, postProcessing and log files.
+# The 0, 0.orig, constant and system directories of a case are never touched.
+#
+# The installed executable in $FOAM_USER_APPBIN is left in place; remove it
+# manually if a full uninstall is wanted.
+#------------------------------------------------------------------------------
+cd "${0%/*}" || exit 1
+
+if [ -z "$WM_PROJECT_DIR" ]; then
+    cat 1>&2 <<'EOF'
+Allclean: the OpenFOAM environment is not set ($WM_PROJECT_DIR is empty).
+
+Source the OpenFOAM etc/bashrc of the local installation first, for example
+
+    . /opt/openfoam14/etc/bashrc
+
+then run ./Allclean again.
+EOF
+    exit 1
+fi
+
+echo "Cleaning the solver build"
+wclean src/coupledSimpleFoam
+rm -rf src/coupledSimpleFoam/Make/linux* \
+       src/coupledSimpleFoam/Make/darwin* \
+       src/coupledSimpleFoam/lnInclude
+
+# OpenFOAM's own cleanCase handles every corner of a case layout, so use it
+# when the installation provides it.
+haveCleanFunctions=no
+if [ -f "$WM_PROJECT_DIR/bin/tools/CleanFunctions" ]; then
+    . "$WM_PROJECT_DIR/bin/tools/CleanFunctions"
+    haveCleanFunctions=yes
+fi
+
+clean_case()
+{
+    dir=$1
+
+    if [ -f "$dir/Allclean" ]; then
+        ( cd "$dir" && sh ./Allclean ) > /dev/null 2>&1
+        return
+    fi
+
+    if [ "$haveCleanFunctions" = yes ]; then
+        ( cd "$dir" && cleanCase ) > /dev/null 2>&1
+        return
+    fi
+
+    if command -v foamListTimes > /dev/null 2>&1; then
+        # Removes every time directory except 0 and constant
+        ( cd "$dir" && foamListTimes -rm ) > /dev/null 2>&1
+        ( cd "$dir" && foamListTimes -rm -processor ) > /dev/null 2>&1
+    fi
+
+    rm -rf "$dir"/processor* \
+           "$dir"/postProcessing \
+           "$dir"/VTK \
+           "$dir"/*.OpenFOAM \
+           "$dir"/*.foam
+
+    # Only a mesh that the case can regenerate is safe to delete
+    if [ -f "$dir/system/blockMeshDict" ]; then
+        rm -rf "$dir/constant/polyMesh"
+    fi
+
+    rm -f "$dir"/log.* "$dir"/*.log
+}
+
+if [ -d tutorials ]; then
+    echo "Cleaning tutorial output"
+
+    for runner in $(find tutorials -mindepth 2 -maxdepth 3 -name Allrun -type f | sort)
+    do
+        case=$(dirname "$runner")
+        echo "    ${case#tutorials/}"
+        clean_case "$case"
+    done
+fi
+
+rm -f log.*
+
+echo "Done"
+
+#------------------------------------------------------------------------------

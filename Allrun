@@ -1,0 +1,112 @@
+#!/bin/sh
+#------------------------------------------------------------------------------
+# coupledSimpleFoam - run every tutorial and print a pass/fail summary.
+#
+# This file is part of coupledSimpleFoam and is distributed under the GNU
+# General Public License version 3; see the LICENSE file at the root of this
+# repository.
+#
+# Usage
+#     ./Allrun
+#
+# Every directory under tutorials/ that carries an executable Allrun script is
+# a case.  Both a flat layout (tutorials/<case>/Allrun) and a grouped layout
+# (tutorials/<group>/<case>/Allrun) are picked up.  Each case runs in its own
+# directory; its console output is kept in <case>/log.Allrun.
+#
+# A case fails when its Allrun exits non-zero or when any log file it produced
+# contains a FOAM FATAL ERROR - many Allrun scripts redirect the solver output
+# and exit zero regardless, so the exit status alone is not conclusive.
+#
+# Exits non-zero if any case failed.
+#------------------------------------------------------------------------------
+cd "${0%/*}" || exit 1
+
+if [ -z "$WM_PROJECT_DIR" ]; then
+    cat 1>&2 <<'EOF'
+Allrun: the OpenFOAM environment is not set ($WM_PROJECT_DIR is empty).
+
+Source the OpenFOAM etc/bashrc of the local installation first, for example
+
+    . /opt/openfoam14/etc/bashrc
+
+then run ./Allrun again.
+EOF
+    exit 1
+fi
+
+if [ ! -x "$FOAM_USER_APPBIN/coupledSimpleFoam" ]; then
+    echo "Allrun: coupledSimpleFoam is not built.  Run ./Allwmake first." 1>&2
+    exit 1
+fi
+
+if [ ! -d tutorials ]; then
+    echo "Allrun: no tutorials directory found" 1>&2
+    exit 1
+fi
+
+runners=$(find tutorials -mindepth 2 -maxdepth 3 -name Allrun -type f | sort)
+
+if [ -z "$runners" ]; then
+    echo "Allrun: no tutorial Allrun scripts found under tutorials/"
+    exit 0
+fi
+
+nPass=0
+nFail=0
+failed=""
+
+for runner in $runners
+do
+    case=$(dirname "$runner")
+    name=${case#tutorials/}
+
+    echo "===================================================================="
+    echo "Running $name"
+    echo "===================================================================="
+
+    ( cd "$case" && sh ./Allrun ) > "$case/log.Allrun" 2>&1
+    status=$?
+
+    if [ $status -eq 0 ] && \
+       ! grep -q -e "FOAM FATAL ERROR" -e "FOAM FATAL IO ERROR" \
+             "$case"/log.* 2>/dev/null
+    then
+        echo "PASS  $name"
+        nPass=$((nPass + 1))
+    else
+        if [ $status -ne 0 ]; then
+            echo "FAIL  $name  (Allrun exited $status)"
+        else
+            echo "FAIL  $name  (FOAM FATAL ERROR in the case logs)"
+        fi
+        echo "      see $case/log.Allrun"
+        nFail=$((nFail + 1))
+        failed="$failed $name"
+    fi
+    echo
+done
+
+# Tutorial directories that carry no runnable case at all
+for dir in tutorials/*/
+do
+    [ -d "$dir" ] || continue
+    if [ -z "$(find "$dir" -maxdepth 2 -name Allrun -type f)" ]; then
+        name=${dir%/}
+        name=${name#tutorials/}
+        echo "FAIL  $name  (no Allrun script)"
+        nFail=$((nFail + 1))
+        failed="$failed $name"
+    fi
+done
+
+echo "===================================================================="
+echo "Summary: $nPass passed, $nFail failed"
+if [ $nFail -ne 0 ]; then
+    echo "Failed:$failed"
+fi
+echo "===================================================================="
+
+[ $nFail -eq 0 ] || exit 1
+
+#------------------------------------------------------------------------------

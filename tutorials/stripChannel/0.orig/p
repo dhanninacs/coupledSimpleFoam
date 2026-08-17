@@ -1,0 +1,55 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       volScalarField;
+    location    "0";
+    object      p;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Kinematic pressure, p/rho, in m^2/s^2
+
+dimensions      [0 2 -2 0 0 0 0];
+
+internalField   uniform 0;
+
+boundaryField
+{
+    inlet
+    {
+        type            zeroGradient;
+    }
+
+    // This fixedValue patch sets the pressure level of the whole domain, so
+    // pRefCell / pRefValue in the COUPLED dictionary are not used.  It also
+    // makes the inlet-average pressure directly the inlet-to-outlet drop.
+    outlet
+    {
+        type            fixedValue;
+        value           uniform 0;
+    }
+
+    walls
+    {
+        type            zeroGradient;
+    }
+
+    fins
+    {
+        type            zeroGradient;
+    }
+
+    frontAndBack
+    {
+        type            empty;
+    }
+}
+
+// ************************************************************************* //

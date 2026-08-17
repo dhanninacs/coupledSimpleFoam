@@ -1,0 +1,60 @@
+#------------------------------------------------------------------------------
+# OpenFOAM build artefacts
+#------------------------------------------------------------------------------
+**/Make/linux*/
+**/Make/darwin*/
+**/Make/*Clang*/
+**/Make/*Icc*/
+lnInclude/
+platforms/
+*.dep
+*.o
+*.so
+*.a
+
+#------------------------------------------------------------------------------
+# Case run output
+#------------------------------------------------------------------------------
+processor*/
+postProcessing/
+VTK/
+log.*
+*.log
+*.OpenFOAM
+*.foam
+
+# Time directories written by the solver.  0, 0.orig, constant and system are
+# part of a case and stay tracked.
+tutorials/*/[0-9]*/
+tutorials/*/*/[0-9]*/
+!tutorials/*/0/
+!tutorials/*/*/0/
+!tutorials/*/0.orig/
+!tutorials/*/*/0.orig/
+
+# Scratch directory for cases run outside tutorials/
+run/
+
+#------------------------------------------------------------------------------
+# Python
+#------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+#------------------------------------------------------------------------------
+# Editor and operating-system cruft
+#------------------------------------------------------------------------------
+*~
+*.swp
+*.swo
+*.rej
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Output of the reference prototype
+tools/reference_prototype/results_*.json

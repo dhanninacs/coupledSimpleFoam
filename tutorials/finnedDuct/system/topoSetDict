@@ -1,0 +1,34 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      topoSetDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Builds the cellSet `fluid` = the whole duct block minus one fin block.
+// subsetMesh then keeps `fluid` and moves the newly exposed internal faces
+// onto the `fins` patch declared in blockMeshDict.
+
+actions
+(
+    // One fin block, seated on the z = 0 symmetry plane, so the meshed fin is
+    // a half fin and sideWall_lo loses the 40 faces it covers.
+    { name strips; type cellSet; action new; source boxToCell;
+      boxes ( (0.6 0.2 -1)(0.9 0.3 0.1875) ); }
+
+    { name fluid; type cellSet; action new; source boxToCell;
+      box (-10 -10 -10)(10 10 10); }
+
+    { name fluid; type cellSet; action delete; source cellToCell;
+      set strips; }
+);
+
+// ************************************************************************* //
