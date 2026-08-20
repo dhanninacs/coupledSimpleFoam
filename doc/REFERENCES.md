@@ -148,11 +148,16 @@ otherwise.
   coupled pressure-velocity system". *Computers & Fluids*, 167:100-110, 2018.
   doi:[10.1016/j.compfluid.2018.02.034](https://doi.org/10.1016/j.compfluid.2018.02.034)
 
-  The block-AMG target for coupled pressure-velocity systems: coarsening driven
+  Block-selective AMG for coupled pressure-velocity systems: coarsening driven
   by a selected equation set rather than by point-wise strength of connection.
   It defines what a purpose-built preconditioner for this matrix looks like, and
-  is the benchmark the shipped off-the-shelf field-split configuration is judged
-  against.
+  the qualification carries weight, because the same architecture assembled from
+  generic library components has been measured at 8.6 million unknowns and costs
+  three to four times more per outer iteration than the Schur splitting it would
+  replace (doc/BENCHMARKS.md section 9.3). The selective coarsening and block
+  smoothers described here are therefore what a competitive implementation would
+  have to be written out of, rather than an untried alternative to the shipped
+  field-split configuration.
 
 - **Uroić & Jasak (2021)**
 
@@ -242,6 +247,43 @@ otherwise.
   this solver, and the reason the screening insists a configuration prove itself
   on more than one flow topology before becoming a default.
 
+- **Dembo, Eisenstat & Steihaug (1982)**
+
+  R. S. Dembo, S. C. Eisenstat and T. Steihaug. "Inexact Newton methods". *SIAM
+  Journal on Numerical Analysis*, 19(2):400-408, 1982.
+  doi:[10.1137/0719025](https://doi.org/10.1137/0719025)
+
+  The origin of the inexact-Newton idea, and of the forcing term itself: the
+  inner linear solve is asked only to reduce the residual of the current iterate
+  by a factor, and the local convergence theory is what makes a sequence of
+  deliberately loose inner solves legitimate rather than merely cheap. The outer
+  loop here is Picard rather than Newton, so the theory does not carry over
+  verbatim, but the quantity `adaptiveTolerance` sets is this forcing term and
+  the convergence test it presumes is the one that paper defines.
+
+- **Eisenstat & Walker (1996)**
+
+  S. C. Eisenstat and H. F. Walker. "Choosing the forcing terms in an inexact
+  Newton method". *SIAM Journal on Scientific Computing*, 17(1):16-32, 1996.
+  doi:[10.1137/0917003](https://doi.org/10.1137/0917003)
+
+  The source of the adaptive inner-tolerance schedule, implemented here as the
+  `adaptiveTolerance` switch and its four keys. The forcing term for each
+  solve is formed from the ratio of successive nonlinear block residuals, so the
+  linear solve is asked for exactly the accuracy the nonlinear iteration can
+  still use - loose while the outer residual falls steeply, tightening as it
+  flattens; `adaptiveGamma` and `adaptiveAlpha` are the paper's two parameters.
+  Its safeguard is implemented alongside the schedule, holding the forcing term
+  up to `adaptiveGamma` times the previous term raised to `adaptiveAlpha`
+  whenever that quantity exceeds 0.1, so that one unusually good outer iteration
+  cannot discard the accuracy the next one needs; it goes quiet of its own
+  accord once the forcing terms are small, and `relTolMin` and `relTolMax` clamp
+  what survives. The forcing term is defined against the residual of the current
+  iterate, which is why the adaptive path also selects PETSc's
+  initial-residual-relative convergence test: under the default
+  `||b||`-relative test a warm-started loose solve is already converged on entry
+  and returns without taking a Krylov step.
+
 - **Henson & Yang (2002)**
 
   V. E. Henson and U. M. Yang. "BoomerAMG: a parallel algebraic multigrid solver
@@ -250,8 +292,12 @@ otherwise.
 
   The algebraic multigrid method applied to the pressure Schur complement in the
   default parallel configuration. Replacing the smoothed-aggregation multigrid on
-  that block with BoomerAMG is the single largest measured improvement in
-  solution time.
+  that block with BoomerAMG was worth 2.7x on the case it was first measured on.
+  Its defaults are not size-neutral, though: `strong_threshold 0.25` is a
+  two-dimensional value, and retuning it to hypre's recommended 0.5 for three
+  dimensions, with HMIS coarsening and truncated `ext+i` interpolation, was in
+  turn the single largest step in tuning the solver for large three-dimensional
+  meshes (doc/BENCHMARKS.md section 9.1).
 
 - **Falgout & Yang (2002)**
 
@@ -281,7 +327,10 @@ otherwise.
   The parallel linear-algebra backend. The solver assembles into `MATMPIAIJ`
   through the COO interface, sets a block size of 4 on the matrix, and solves
   with `KSP`; every preconditioner choice is exposed as a runtime PETSc options
-  string.
+  string. The declared block size supplies the field-split index sets, but it is
+  not forwarded to external packages: hypre's systems-AMG options need
+  `-pc_hypre_boomeramg_numfunctions 4` passed explicitly, or the library runs at
+  one function per node and every block-aware option degenerates silently.
 
 - **Brown, Knepley, May, McInnes & Smith (2012)**
 
@@ -294,6 +343,19 @@ otherwise.
   pressure rows of the assembled system be preconditioned by different methods
   and composed as a Schur factorisation - the mechanism the default
   configuration relies on.
+
+- **Bnà, Spisso, Olesen & Rossi (2020)**
+
+  S. Bnà, I. Spisso, M. Olesen and G. Rossi. *PETSc4FOAM: a library to plug-in
+  PETSc into the OpenFOAM framework*. PRACE white paper WP294, 2020.
+  doi:[10.5281/zenodo.3923780](https://doi.org/10.5281/zenodo.3923780) ·
+  [develop.openfoam.com/modules/external-solver](https://develop.openfoam.com/modules/external-solver)
+
+  The prior art for coupling PETSc to OpenFOAM: caching of the sparsity pattern,
+  the mapping from OpenFOAM's addressing to PETSc's global row indices, and the
+  cost accounting for repeated assembly - all of which informed this solver's
+  own assembly path, which builds a global-index system directly rather than
+  translating a segregated one.
 
 - **Guennebaud, Jacob et al. (Eigen)**
 
@@ -362,88 +424,7 @@ otherwise.
 
 ---
 
-## 5. GPU acceleration for CFD linear algebra
-
-- **Naumov et al. (2015)**
-
-  M. Naumov, M. Arsaev, P. Castonguay, J. Cohen, J. Demouth, J. Eaton, S. Layton,
-  N. Markovskiy, I. Reguly, N. Sakharnykh, V. Sellappan and R. Strzodka. "AmgX: a
-  library for GPU accelerated algebraic multigrid and preconditioned iterative
-  methods". *SIAM Journal on Scientific Computing*, 37(5):S602-S626, 2015.
-  doi:[10.1137/140980260](https://doi.org/10.1137/140980260) ·
-  [github.com/NVIDIA/AMGX](https://github.com/NVIDIA/AMGX)
-
-  Aggregation-based algebraic multigrid on the GPU, including native support for
-  small dense blocks - the closest production match to a block-AMG for a block
-  size of 4 system. It is reachable from this solver through PETSc's `PCAMGX`
-  when PETSc is configured with AmgX.
-
-- **Oliani, Fadiga, Spisso, Capone & Piscaglia (2024)**
-
-  S. Oliani, E. Fadiga, I. Spisso, L. Capone and F. Piscaglia. "GPU-accelerated
-  linear algebra for coupled solvers in industrial CFD applications with
-  OpenFOAM". arXiv:2403.07882, 2024.
-  doi:[10.48550/arXiv.2403.07882](https://doi.org/10.48550/arXiv.2403.07882)
-
-  The industrial precedent for exactly this architecture - an OpenFOAM coupled
-  solver offloading the block linear system to GPU algebraic multigrid - and the
-  source of the expectation that the payoff comes from the multigrid method
-  itself rather than from the device.
-
-- **Anzt et al. (2022)**
-
-  H. Anzt, T. Cojean, G. Flegar, F. Göbel, T. Grützmacher, P. Nayak, T. Ribizel,
-  Y. M. Tsai and E. S. Quintana-Ortí. "Ginkgo: a modern linear operator algebra
-  framework for high performance computing". *ACM Transactions on Mathematical
-  Software*, 48(1):1-33, 2022.
-  doi:[10.1145/3480935](https://doi.org/10.1145/3480935)
-
-  A vendor-neutral alternative to a CUDA-only backend, surveyed when choosing
-  where the assembled triplets should be sent; relevant because the solver's
-  assembly deliberately emits backend-agnostic COO data.
-
-- **Olenik, Koch, Boutanios & Anzt (2025)**
-
-  G. Olenik, M. Koch, Z. Boutanios and H. Anzt. "Towards a platform-portable
-  linear algebra backend for OpenFOAM". *Meccanica*, 60(6):1659-1672, 2025.
-  doi:[10.1007/s11012-024-01806-1](https://doi.org/10.1007/s11012-024-01806-1) ·
-  [github.com/hpsim/OGL](https://github.com/hpsim/OGL)
-
-  The OpenFOAM Ginkgo Layer (OGL): how an external GPU linear-algebra library is
-  attached to OpenFOAM in practice, and measurements of when offloading a sparse
-  solve to a device is worth the transfer cost.
-
-- **Mills et al. (2021), and PETSc GPU documentation**
-
-  R. T. Mills, M. F. Adams, S. Balay, J. Brown, A. Dener, M. Knepley, S. E.
-  Kruger, H. Morgan, T. Munson, K. Rupp, B. F. Smith, S. Zampini, H. Zhang and
-  J. Zhang. "Toward performance-portable PETSc for GPU-based exascale systems".
-  *Parallel Computing*, 108:102831, 2021.
-  doi:[10.1016/j.parco.2021.102831](https://doi.org/10.1016/j.parco.2021.102831) ·
-  *GPU Support Roadmap*,
-  [petsc.org/release/overview/gpu_roadmap](https://petsc.org/release/overview/gpu_roadmap/)
-
-  The device-memory model behind PETSc's GPU path. The COO assembly interface the
-  solver already uses is the one designed for device assembly, so the optional
-  CUDA build changes only matrix and vector types and the preconditioner string,
-  not the solver's own code.
-
-- **Bnà, Spisso, Olesen & Rossi (2020)**
-
-  S. Bnà, I. Spisso, M. Olesen and G. Rossi. *PETSc4FOAM: a library to plug-in
-  PETSc into the OpenFOAM framework*. PRACE white paper WP294, 2020.
-  doi:[10.5281/zenodo.3923780](https://doi.org/10.5281/zenodo.3923780) ·
-  [develop.openfoam.com/modules/external-solver](https://develop.openfoam.com/modules/external-solver)
-
-  The prior art for coupling PETSc to OpenFOAM: caching of the sparsity pattern,
-  the mapping from OpenFOAM's addressing to PETSc's global row indices, and the
-  cost accounting for repeated assembly - all of which informed this solver's
-  own assembly path, which builds a global-index system directly rather than
-  translating a segregated one.
-
----
-
-## 6. Turbulence models
+## 5. Turbulence models
 
 Turbulence is not part of the coupled system: the models below are solved
 segregated and lagged one outer iteration behind the coupled momentum-continuity
@@ -499,7 +480,7 @@ library's own implementations cite.
 
 ---
 
-## 7. Further reading
+## 6. Further reading
 
 - **Ferziger, Perić & Street (2020)**
 
@@ -539,7 +520,12 @@ library's own implementations cite.
   Pairwise aggregation with a K-cycle: the cheap-setup multigrid design that
   matters when the operator changes every outer iteration, as it does here, and
   the starting point for anyone implementing a purpose-built block-AMG for this
-  matrix.
+  matrix. That is now the only open route to one, the same architecture built
+  from generic library components having been measured and rejected on cost
+  (doc/BENCHMARKS.md section 9.3). Setup cost is still the quantity that
+  decides the design: on the largest case the tuned three-dimensional hierarchy
+  is cheap enough per cycle that rebuilding it only every eighth outer iteration
+  is the faster choice, which is the same economics seen from the other side.
 
 - **Jasak (1996)**
 

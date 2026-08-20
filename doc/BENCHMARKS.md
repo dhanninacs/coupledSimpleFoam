@@ -16,10 +16,20 @@ Two summary statements set the frame for everything below.
   (7.8x to 200x on the laminar cases here), needs no under-relaxation factors,
   and its outer-iteration count does not grow with mesh refinement or with the
   number of MPI ranks.
-- Each outer iteration is much more expensive. At production residual levels
-  on cases a well-tuned segregated solver already handles, it is currently
-  slower in wall clock - 2.2x slower on the largest laminar case measured, and
-  substantially slower on small RANS cases.
+- Each outer iteration is much more expensive, so wall clock turns on problem
+  size. The crossover on this hardware sits near 300k cells (Section 9.4):
+  below it the segregated solver is ahead, and on the small two-dimensional
+  through-flow cases it wins outright; above it the flat coupled iteration
+  count compounds, and with the tuned configuration of Section 9.2 the coupled
+  solver is 1.3x faster at 533k cells, 2.0x at 1.07M and 2.3x at 2.15M. RANS is
+  the exception at every size measured, because the lagged turbulence sets the
+  convergence floor for both solvers.
+
+This document is chronological, and the three-dimensional sections were written
+as the configuration improved. Where an early section records a configuration
+that was slower than segregated at a size where the tuned one is now faster,
+the numbers stand as they were measured and the text says which section
+supersedes the conclusion.
 
 Contents:
 
@@ -30,10 +40,13 @@ Contents:
 4. [Three-dimensional wall-resolved unit
    cell](#4-three-dimensional-wall-resolved-unit-cell-483k-cells-19m-unknowns)
 5. [Configuration study](#5-configuration-study)
-6. [GPU](#6-gpu)
-7. [RANS](#7-rans)
-8. [Summary and interpretation](#8-summary-and-interpretation)
-9. [Reproducing these results](#9-reproducing-these-results)
+6. [RANS](#6-rans)
+7. [Summary and interpretation](#7-summary-and-interpretation)
+8. [Scale-up: 2.15 million cells, 8.6 million
+   unknowns](#8-scale-up-215-million-cells-86-million-unknowns)
+9. [Beating the segregated solver: the tuned large-case
+   configuration](#9-beating-the-segregated-solver-the-tuned-large-case-configuration)
+10. [Reproducing these results](#10-reproducing-these-results)
 
 
 ## 1. Method
@@ -62,18 +75,29 @@ one; both are counted the same way, as passes over the same case.
 idle machine unless the row is marked. Two classes of row are marked
 explicitly and must not be compared against unmarked rows: rows measured while
 an unrelated job shared the machine (inflated by roughly 1.5x in Section 5 and
-roughly 3.5x in Section 7), and one row that is an estimate rather than a
+roughly 3.5x in Section 6), and one row that is an estimate rather than a
 measurement.
 
+**Measurement protocol.** Every timing in this document is a single run with the
+machine otherwise idle. Later measurements were serialised with an advisory file
+lock, because an earlier harness that polled for a free machine allowed two
+batches to overlap; where that affected a number it has been re-measured and the
+re-measured value is the one quoted. Repeats within one session agree to about
+**2 %** (a 2.15M-cell coupled run repeated back to back at 218 s and 214 s).
+Independent sessions differ by up to
+about **5 %**: the 2.15M-cell pair quoted throughout as 203 s coupled against
+478 s segregated was re-measured under the lock at 218 s and 214 s against 488 s. The
+ratio is stable at **2.3 times** in both, and ratios rather than absolute
+seconds are what should be carried away from this document. Differences below
+5 % between two configurations measured in different sessions are not
+meaningful.
+
 **Hardware and software.** A 24-core workstation running OpenFOAM 14. Eigen
-3.4.0 for the serial direct and iterative backends; PETSc 3.19.6 from
-distribution packages for the CPU rows; PETSc 3.25.4 built from source with
-CUDA and hypre for the GPU rows; system OpenMPI 4.1.6, which is not CUDA-aware.
-Rank counts are stated per row (serial, np4, np6, np8). Decomposition is
+3.4.0 for the serial direct and iterative backends; PETSc with hypre for the
+PETSc rows, 3.19.6 from distribution packages and 3.25.4 built from source;
+system OpenMPI 4.1.6. Rank counts are stated per row. Decomposition is
 `scotch` for the two-dimensional cases and `simple` with `n (N 1 1)` for the
-three-dimensional unit cell. GPU rows additionally use one workstation-class
-NVIDIA card (Ada generation, 20 GB, sm_89, 48 SMs, 1/64-rate FP64) under WSL2
-with no MPS available; Section 6 states the scope of those results.
+three-dimensional unit cell.
 
 **Reported quantities.** `dP` is a kinematic pressure drop (pressure divided
 by density), taken from the same `functionObject` in both solvers - the
@@ -311,6 +335,15 @@ At production accuracy the segregated solver is 2.2x faster in wall clock
 while taking 5.9x more iterations. The coupled solver is the only one of the
 two that can be driven to deep residuals on this mesh at all.
 
+That 2.2x is a property of the configuration this section measures, not of the
+size. It predates the adaptive inner tolerance, the periodic preconditioner
+rebuild and the three-dimensional AMG settings of Section 9, each of which is
+worth a large factor at and above this scale; on the structured meshes of
+Section 9.4 the tuned configuration is already ahead by 1.3x at 533k cells.
+The tuned configuration has not been re-run on this `snappyHexMesh` mesh, so
+every row here stands exactly as measured and none of them should be read as
+the current wall-clock verdict.
+
 ### 4.2 Progression: what each change bought
 
 Same case, same mesh, np6 throughout. Each row differs from the one above it
@@ -322,11 +355,14 @@ by the single change named.
 | Coupled baseline: fieldsplit-Schur + GAMG, inner `relTol 1e-12` | 20 | 496 s | ~25 | 5e-7 / 3e-6 | 660.25 | robust, but pays for near-exact inner solves |
 | + pseudo-transient continuation, inner `relTol 1e-6` | 21 | 259 s | 12.3 | 1.9e-7 / 2.3e-6 | 660.49 | 1.9x - looser inner solves at the same outer count |
 | + batched COO assembly | 21 | 257.3 s | 12.2 | - | - | 0.7 % - the insertion loop was never the bottleneck |
-| + hypre BoomerAMG instead of GAMG on the Schur block | 24 | 91-95 s | 3.7-3.8 | - | 660.49 | 2.7x - inner iterations 188 -> ~75, one options-string line, no GPU |
+| + hypre BoomerAMG instead of GAMG on the Schur block | 24 | 91-95 s | 3.7-3.8 | - | 660.49 | 2.7x - inner iterations 188 -> ~75, one options-string line |
 
 The last row is the important one. It is a one-line change to `petscOptions`,
-requires no rebuild and no accelerator, and is worth more than every other
-optimisation in this document combined. It is the shipped default.
+requires no rebuild and no accelerator, and at 2.7x is still the largest single
+factor any one change has bought in this document. It is the shipped default.
+The four changes of Section 9.1 are each smaller than it and compound to more
+than it; two of them are options-string lines like this one, and two set solver
+options added since.
 
 Batched assembly is included because it is a measured negative:
 `MatSetPreallocationCOO` / `MatSetValuesCOO` replaced roughly 30 million
@@ -335,8 +371,7 @@ per iteration. The per-iteration cost is the inner Krylov solve plus
 preconditioner setup, and nothing else. The change is numerically equivalent -
 on the strip-channel case at np4 the batched path reproduces both the
 iteration count and the pressure drop to every printed digit - so the residual
-and dP columns of that row are not separately reported. (The same batched API is
-PETSc's device assembly API, which is what the GPU path uses; see Section 6.)
+and dP columns of that row are not separately reported.
 
 A re-measurement of the GAMG-on-Schur configuration at a different time gave
 21 outer iterations in 221.4 s (9.77 s/outer) rather than 257 s (12.2 s/outer).
@@ -399,11 +434,17 @@ compared with unmarked rows.
 | `reusePreconditioner yes` (pseudo-transient, inner 1e-6) | 21 | 392.7 s vs 257.3 s fresh | as baseline | as baseline | counterproductive, +53 %; freezing only the hierarchy structure costs +66 % |
 | Batched COO assembly (pseudo-transient, inner 1e-6) | 21 | 257.3 s vs 259.0 s | as baseline | as baseline | 0.7 %, within noise of nothing |
 
-The preconditioner-reuse result has a design consequence: the Picard operator
-changes fast enough between outer iterations that a stale preconditioner costs
-more inner iterations than its setup saved. Any future block-AMG work has to
-make fresh setup intrinsically cheap rather than amortise setup across
-iterations.
+The preconditioner-reuse result reads as a design consequence: the Picard
+operator changes fast enough between outer iterations that a stale
+preconditioner costs more inner iterations than its setup saved. Two later
+measurements narrow that statement. The row above freezes the hierarchy for the
+whole run, whereas rebuilding it on a fixed interval is worth 6 % at 8.6M
+unknowns and, once each cycle had been made cheap by the three-dimensional AMG
+settings, a factor of 1.7 at the same size (Section 9.1); the useful rule is
+that reuse pays in proportion to how cheap each application already is, not
+that reuse never pays. And the block-AMG alternative is no longer an open
+question: it was built through hypre and PETSc, measured at 8.6M unknowns and
+rejected on cost (Section 9.3).
 
 ### 5.2 Preconditioner choice depends on mesh topology
 
@@ -438,6 +479,15 @@ A direct comparison on one mesh, cavity 256x256 at np6 with `relTol 1e-12`:
 The same contrast on the 128x128 cavity at np6, measured separately: 6.29 s
 with ASM/ILU against 2.17 s with fieldsplit.
 
+Size matters as well as topology, and it begins to matter above the sizes in
+this table. The `selfp` Schur approximation forms an explicit sparse matrix
+product every outer iteration; at 1.93M unknowns that is affordable, and at
+8.6M unknowns it becomes the dominant cost and is replaced by the `a11` option,
+which reuses the pressure block the assembly already builds (Section 8.1).
+`selfp` remains the shipped default
+because it is the more robust of the two on small and strongly non-orthogonal
+meshes, which is the majority of what the solver is pointed at.
+
 ### 5.3 Inner tolerance is regime-dependent and cannot be set once
 
 A loose inner tolerance does not merely slow the outer loop, it stops it
@@ -458,218 +508,16 @@ The large-3-D-RANS row is the exception to the "do not loosen for RANS" rule
 and exists because `nuEff` heterogeneity degrades both the velocity-block
 preconditioner and the `selfp` Schur approximation at once.
 
-
-## 6. GPU
-
-**Scope.** Every GPU number here was measured on one workstation-class NVIDIA
-card (Ada generation, 20 GB, sm_89, 48 SMs, 1/64-rate FP64) under WSL2, with
-no MPS available and a system OpenMPI that is not CUDA-aware. Under WSL2 each
-MPI rank creates its own CUDA context on the single device (about 0.4 s and
-300 MB per rank) and the contexts time-slice. These conclusions are specific
-to that hardware and platform class and should not be read as statements about
-GPU acceleration in general.
-
-**Enabling the device path** costs nothing in the solver: adding
-`-mat_type aijcusparse -vec_type cuda` to `petscOptions` is sufficient, with no
-rebuild of the solver logic and no change on the OpenFOAM side, because the
-batched COO assembly adopted for MPI is already the PETSc GPU assembly API.
-
-### 6.1 Correctness
-
-The CPU sanity gate, run with the CUDA-enabled PETSc but no GPU flags, on the
-strip channel at Re 1000, np4, ASM(2)/ILU(2), `relTol 1e-12`:
-
-| Build | Outer iterations | Inlet dP |
-| --- | ---: | --- |
-| Reference: serial Eigen `SparseLU` | 25 | 7.92849560e-01 |
-| Distribution PETSc 3.19.6, np4 | 25 | 7.92849560e-01 |
-| Source PETSc 3.25.4 with CUDA, np4 | 25 | 7.92849560e-01 |
-
-The device path is equally exact. Because the outer loop is a Picard iteration
-driven to a fixed `residualControl`, any preconditioner that genuinely solves
-the linear system to 1e-12 must reproduce the reference, which makes this small
-case a correctness gate rather than a smoke test:
-
-| Configuration (43,680 unknowns, np4) | Outer | dP | Wall | Last inner KSP its |
-| --- | ---: | --- | ---: | --- |
-| CPU ASM/ILU(2) | 25 | 7.92849560e-01 | 2.92 s | 645 |
-| GPU ASM/ILU(2) | 25 | 7.92849560e-01 | 98.6 s | 561 |
-| CPU bjacobi/ILU | 25 | 7.92849560e-01 | 4.77 s | 1418 |
-| GPU bjacobi/ILU | 25 | 7.92849560e-01 | 133.3 s | 1416 |
-| CPU jacobi | 25 | 7.92849560e-01 | 19.8 s | 5000 (`DIVERGED_ITS`) |
-| GPU jacobi | 21 of 30 | - | timeout at 180 s | 5000 (`DIVERGED_ITS`) |
-| CPU hypre BoomerAMG (scalar, whole system) | 30, no convergence | - | 12.7 s | 5000 (`DIVERGED_ITS`) |
-| GPU hypre BoomerAMG (scalar, whole system) | 5 of 30 | - | timeout at 180 s | 858 (converged) |
-| CPU hypre BoomerAMG nodal | 25 | 7.92849560e-01 | 11.9 s | 2361 |
-| GPU hypre BoomerAMG nodal | - | - | segmentation fault | - |
-| CPU fieldsplit-Schur + GAMG | 30, no convergence | - | 95.0 s | 5000 (`DIVERGED_ITS`) |
-| GPU fieldsplit-Schur + GAMG | 2 of 30 | - | timeout at 180 s | 5000 (`DIVERGED_ITS`) |
-| GPU AmgX CLASSICAL | - | - | segmentation fault | - |
-| GPU AmgX AGGREGATION | - | - | segmentation fault | - |
-
-Both converging preconditioners reproduce the reference exactly on the device.
-At 43,680 unknowns the GPU is about 30x slower, which is the expected result:
-roughly 11k unknowns per rank is far below the kernel-launch break-even. Note
-also that hypre BoomerAMG behaves differently on CPU and GPU by design,
-because hypre's device build must use device-compatible coarsening and
-interpolation (PMIS with extended interpolation) where the CPU default is
-Falgout with classical interpolation.
-
-### 6.2 Screening on the 483k-cell unit cell
-
-np6, five outer iterations, ranked by steady s/outer = (T5 - T1) / 4, which
-excludes one-off CUDA context creation and first preconditioner setup. `FS` is
-fieldsplit Schur, `fact_type full`, `precondition selfp`, split 0,1,2 / 3.
-
-| Configuration | Velocity block | Schur block | s/outer | Inner KSP its | GPU util (max) |
-| --- | --- | --- | ---: | ---: | ---: |
-| CPU FS + GAMG (the then-default) | bjacobi/ILU | GAMG | 19.95 | 188 | 5 % |
-| GPU FS + GAMG | bjacobi/ILU | GAMG | 16.52 | 188 | 99 % |
-| GPU FS + hypre | bjacobi/ILU | BoomerAMG | 8.25 | 73 | 98 % |
-| GPU FS + hypre, cuSPARSE ILU | bjacobi/ILU-cusparse | BoomerAMG | 8.24 | 73 | 98 % |
-| GPU FS + hypre, Jacobi velocity block | jacobi | BoomerAMG | 15.75 | 181 | 97 % |
-| CPU FS + hypre | bjacobi/ILU | BoomerAMG | 7.72 | 77 | 19 % |
-| GPU ASM/ILU-cusparse (monolithic) | - | - | 36.32 | 2000 (`DIVERGED`) | 99 % |
-
-Four readings. The large win is algorithmic, not architectural: GAMG to hypre
-on the Schur block is 2.6x, entirely on the CPU. With the preconditioner held
-fixed the GPU loses by 7 % (8.25 against 7.72). The GPU only wins where the CPU
-preconditioner is weak (16.52 against 19.95 with GAMG, 1.21x), which is a
-bigger device share of a worse algorithm. And this is not an under-utilisation
-problem: the device sits at 97-99 % utilisation and 7-8 GB of 20 GB throughout.
-Two further negatives: replacing the velocity-block ILU sub-solve with a
-cuSPARSE ILU, which removes a host fallback, is worth 0.01 s/outer, and
-replacing that block with plain Jacobi to make it fully device-resident nearly
-doubles the inner iteration count. Removing host fallbacks is not where the
-time is.
-
-### 6.3 Full runs and rank scaling
-
-483k-cell unit cell, pseudo-transient, `pseudoCo 200`, `relTol 1e-6`,
-`maxLinearIter 2000`.
-
-| Run | np | Outer | Wall | s/outer | Inlet dP | GPU util max/mean | GPU memory |
-| --- | ---: | ---: | ---: | ---: | --- | --- | ---: |
-| GPU FS + hypre | 4 | 25 | 94.3 s | 3.55 | 6.60489958e+02 | 98 % / 81 % | 9.1 GB |
-| GPU FS + hypre | 6 | 26 | 116.4 s | 4.28 | 6.60489962e+02 | 98 % / 87 % | 10.2 GB |
-| GPU FS + hypre | 8 | 25 | 156.7 s | 5.90 | 6.60489711e+02 | 98 % / 87 % | 10.1 GB |
-| CPU FS + hypre | 4 | 30 | 119.9 s | 3.69 | 6.60489721e+02 | - | - |
-| CPU FS + hypre | 6 | 24 | 94.7 s | 3.73 | 6.60489519e+02 | - | - |
-| CPU FS + hypre | 8 | 30 | 104.7 s | 3.23 | 6.60490012e+02 | - | - |
-| CPU FS + GAMG (re-measured) | 6 | 21 | 221.4 s | 9.77 | 6.60489298e+02 | - | - |
-| CPU FS + GAMG (original measurement) | 6 | 21 | 257 s | 12.2 | 6.60489172e+02 | - | - |
-| Segregated reference | 6 | 142 | 41 s | - | - | - | - |
-
-GPU scaling is inverted - 3.55, 4.28, 5.90 s/outer at 4, 6 and 8 ranks. Every
-rank added makes it slower, because without MPS each rank opens its own CUDA
-context on one device and the contexts time-slice, and more subdomains also
-means a slightly weaker preconditioner. The CPU control over the same range is
-flat to improving (3.69, 3.73, 3.23). On this hardware the GPU wants the fewest
-ranks that still fit and the CPU wants the most.
-
-All configurations agree on the answer to 6-7 significant digits against the
-CPU FS+GAMG value 6.60489172e+02: GPU np4 1.2e-6, GPU np6 1.2e-6, GPU np8
-8.2e-7, CPU FS+hypre np6 5.3e-7. The spread is the expected consequence of
-`relTol 1e-6` stopping the outer loop at 24-30 rather than 21 iterations with a
-different preconditioner, not a discretisation difference; the bit-level check
-is Section 6.1, where the tight `relTol 1e-12` runs reproduce the serial
-reference to all printed digits on CPU and GPU alike.
-
-### 6.4 Where the time goes, and why the speedup is modest
-
-`-log_view` profile, np6, best GPU configuration, 117.4 s wall, 26 outer
-iterations, 2.284e11 total flops:
-
-| Event | % of wall | % of flops | GPU %F | Host to device | Device to host |
-| --- | ---: | ---: | ---: | --- | --- |
-| `KSPSolve` | 58 % | 98 % | 100 | 3559 calls / 645 MB | 3372 / 170 MB |
-| `PCApply` | 50 % | 29 % | 100 | 1736 / 429 MB | 1686 / 83 MB |
-| `KSPSolve_FS_Schur` (hypre on the pressure block) | 44 % | 0 %* | 0* | - | - |
-| `PCSetUpOnBlocks` (velocity ILU numeric factorisation) | 25 % | 1 % | 100 | 125 / 1.57 GB | - |
-| `PCSetUp` | 10 % | 2 % | 92 | 244 / 1.61 GB | 224 / 1.82 GB |
-| `MatMult` | 9 % | 40 % | 100 | 2648 / 580 MB | 2572 / 170 MB |
-| `MatMatMultSym` (selfp Schur build) | 7 % | 2 % | 100 | 200 / 1.54 GB | 75 / 220 MB |
-| `MatSetPreallocationCOO` | 4 % | 0 % | - | 102 / 1.30 GB | - |
-| `MatSetValuesCOO` (the assembly handoff) | 1 % | 0 % | - | 0 | 0 |
-| `MatCUSPARSECopyTo` | 2 % | - | - | 352 / 3.50 GB | - |
-| `MatCUSPARSECopyFrom` | 0 % | - | - | - | 100 / 1.53 GB |
-
-\* hypre performs its own device work internally and PETSc cannot attribute
-those flops, so the column reads zero while the wall clock is real.
-
-Three things follow. First, the assembly handoff is free: `MatSetValuesCOO` is
-1 % of wall with zero logged transfers, so the OpenFOAM-side assembly is not a
-bottleneck and needed no GPU-specific work. Second, about 70 % of wall clock is
-preconditioner - 44 % is the single AMG solve on the Schur block and another
-25 % is velocity-block ILU setup - so the achievable device speedup is bounded
-by how much of the preconditioner runs on the device, not by the Krylov
-kernels. Third, 1.53 GB is copied back device to host per run, because
-`PCFIELDSPLIT` extracts submatrices and hypre needs its own IJ format, and both
-round-trip through the host every outer iteration.
-
-That last point is the structural reason the device version cannot win here:
-the matrix is rebuilt and re-shipped every Picard step, so there is nothing to
-amortise. The arithmetic reinforces it. The aggregate rate over `KSPSolve` is
-3.29 GFlop/s. Sparse double-precision linear algebra is bandwidth-bound rather
-than flop-bound - a sparse matrix-vector product does about two flops per
-matrix entry loaded - so the useful figure of merit is memory bandwidth, not
-peak FP64. On top of that this is a 1/64-rate FP64 workstation part, so the
-dense-arithmetic advantage that a datacentre card would bring is absent as
-well. A modest result on this hardware is what the hardware predicts.
-
-### 6.5 Verdict, and the library-level blockers
-
-| | Outer | Wall (best) | vs CPU coupled 257 s | vs segregated 41 s |
-| --- | ---: | ---: | --- | --- |
-| Segregated (np6) | 142 | 41 s | - | 1.0x |
-| CPU coupled, FS + GAMG (previous default, np6) | 21 | 257 s | 1.0x | 6.3x slower |
-| CPU coupled, FS + hypre (np6) | 24 | 94.7 s | 2.7x faster | 2.3x slower |
-| GPU coupled, FS + hypre (np4) | 25 | 94.3 s | 2.7x faster | 2.3x slower |
-
-The GPU ties the CPU: 94.3 s against 94.7 s is a 0.4 % difference. At fixed
-rank count and fixed preconditioner the GPU is ahead only at np4 and loses at
-np6 and np8, and the best s/outer in the entire study is a CPU point (3.23
-s/outer at np8). The 2.7x came from the algorithm change, not the hardware.
-
-Two library-level routes to a device-resident *block* AMG - which is what this
-system actually wants, since the unknowns are genuinely block-4 interleaved -
-were tried and are closed on this platform:
-
-- **AmgX 2.4.0** (the version PETSc pins) hits three walls. It links
-  `CUDA::nvToolsExt`, which CUDA 12.9 removed, so the toolkit must be pinned to
-  12.8. PETSc's `PCSetUp_AMGX` then hands AmgX a mixed host/device CSR - device
-  values from `MatSeqAIJCUSPARSEGetArrayRead` with host indices from
-  `MatGetRowIJ`, which `MATSEQAIJCUSPARSE` does not override - and the upload
-  fails in Thrust. Both were worked around locally. The third wall is not
-  workaroundable: with everything else fixed,
-  `AMGX_matrix_upload_distributed` segfaults inside the WSL2 virtualised CUDA
-  driver's asynchronous host-to-device copy. On PETSc's own
-  `snes/tutorials/ex19` (block size 4, the same structure as this system)
-  `-pc_type amgx` works at np1 on a ~4.4k-row problem and segfaults at ~263k
-  and ~1.05M rows; at more than one rank it fails for any matrix and vector
-  type, including all-host `aij`, in AmgX's distributed consolidation path;
-  and the aggregation path reports `Unsupported device/host algorithm` for
-  every selector, because AmgX resolves those to its host selector
-  implementations, none of which are implemented on the host.
-  The two PETSc source changes used to get that far were made
-  locally and have not been submitted or confirmed against current PETSc; they
-  should be treated as local workarounds, not as fixed upstream bugs. A working
-  AmgX would need bare-metal Linux, or a newer AmgX than the pinned 2.4.0.
-- **hypre's nodal systems AMG has no device implementation** and segfaults on
-  the GPU. It is the only AMG measured to reproduce the reference on the hard
-  two-dimensional topology, so this closes the second route.
-
-What remains available on the device is scalar AMG on the Schur complement,
-which is exactly the shipped configuration.
-
-Based on these measurements rather than hope, a GPU would plausibly pay off
-with: bare-metal Linux and a working block-AMG library; MPS, or one rank per
-GPU, since rank count actively hurts here; a datacentre part with 1/2-rate
-rather than 1/64-rate FP64; and a mesh large enough that the per-Picard matrix
-re-ship stops dominating. None of those applied to the runs above.
+Every row above is a fixed tolerance, and for the large laminar
+three-dimensional regime the choice has since been superseded rather than
+corrected: `adaptiveTolerance` derives the inner tolerance from the ratio of
+successive nonlinear block residuals instead, which is both faster than any
+fixed value tried and, at 8.6M unknowns, the difference between converging and
+not (Section 9.1). The rows above still describe the fixed-tolerance path,
+which is what the shipped defaults use.
 
 
-## 7. RANS
+## 6. RANS
 
 Turbulence is solved segregated and lagged one outer iteration behind the
 coupled pressure-velocity solve, using OpenFOAM's own `momentumTransport`
@@ -677,7 +525,7 @@ models. Only `kEpsilon` and `kOmegaSST` have been exercised; other
 incompressible RAS and LES models are selectable through the run-time
 selection tables of the linked libraries but are untested.
 
-### 7.1 Backward-facing step, kEpsilon, 12,225 cells
+### 6.1 Backward-facing step, kEpsilon, 12,225 cells
 
 Stock tutorial `0/` and `constant/` (`simulationType RAS`, `model kEpsilon`,
 `turbulence on`, `viscosityModel constant`, `nu 1e-05`) with a steady-ised
@@ -722,7 +570,7 @@ or `bounding epsilon` warnings, no NaN and no floating-point exceptions; and
 1.4e-16 at iteration 779), so the coupled continuity rows are still satisfied
 exactly with a turbulent, strongly varying `nuEff`.
 
-### 7.2 The lagged turbulence sets the convergence floor for both solvers
+### 6.2 The lagged turbulence sets the convergence floor for both solvers
 
 Convergence on this case has two phases. Phase 1 is fast and is the coupled
 solver doing what it does: `Ux` falls from 1 to 1.7e-03 in 61 outer iterations
@@ -768,7 +616,7 @@ iteration is far more expensive, so on this 12k-cell two-dimensional RANS case
 SIMPLE wins on wall clock, 61 s against 389 s under the same contended
 conditions.
 
-### 7.3 Cost of the turbulence-capable momentum operator
+### 6.3 Cost of the turbulence-capable momentum operator
 
 The one clean timing comparison in this section: the momentum operator built
 through `momentumTransport->divDevSigma(U)` against the earlier hand-written
@@ -785,7 +633,7 @@ operator builds. Both columns are about 3.5x the idle-machine values elsewhere
 in this document, which is exactly why the ratio and not the absolute time is
 the meaningful number here.
 
-### 7.4 Other RANS cases
+### 6.4 Other RANS cases
 
 Strip channel, kEpsilon at Re 1e5, an independently built case: segregated 224
 iterations at dP 0.27639; coupled 148 iterations, converged, zero bounding
@@ -810,7 +658,7 @@ because `nuEff` heterogeneity degrades both the velocity-block preconditioner
 and the `selfp` Schur approximation. The measured recipe for this class of case
 is `relTol 1e-8` with `maxLinearIter 500` and pseudo-transient continuation.
 
-### 7.5 kOmegaSST, and a regime caveat that applies to both solvers
+### 6.5 kOmegaSST, and a regime caveat that applies to both solvers
 
 `kOmegaSST` additionally requires `wallDist { method meshWave; }` in
 `system/fvSchemes`. On the two-dimensional strip channel at genuinely
@@ -836,7 +684,7 @@ these flows are laminar-transitional and laminar modelling is the correct
 physics. SST is available and behaves correctly in genuinely turbulent regimes
 (demonstrated at Re 2e4) and relaminarises harmlessly on clean meshes.
 
-### 7.6 RANS verdict
+### 6.6 RANS verdict
 
 The turbulence hook is correct - laminar cases are preserved bit for bit, the
 independently built RANS cases converge to the expected answers, and the
@@ -849,13 +697,20 @@ niche is a modestly deeper residual floor at equal compute. Pulling k and
 epsilon into the block system is a documented future direction, not implemented.
 
 
-## 8. Summary and interpretation
+## 7. Summary and interpretation
 
-### 8.1 Where this solver wins
+### 7.1 Where this solver wins
 
+- **Wall clock on large three-dimensional laminar cases.** With the tuned
+  configuration of Section 9.2 the coupled solver is 1.3x faster at 533k
+  cells, 2.0x at 1.07M and 2.3x at 2.15M, on identical meshes, identical
+  schemes and identical convergence criteria, with both solvers at their best
+  settings. The margin grows with the mesh because only one of the two has an
+  iteration count that grows with it.
 - **Outer-iteration count.** 7.8x to 200x fewer iterations than SIMPLE on the
-  laminar cases here, 5.9x on the 483k-cell three-dimensional case, 2.6x end to
-  end on RANS and 4-7x at matched residual levels.
+  laminar cases here, 5.9x on the 483k-cell three-dimensional case, 19x on the
+  2.15M-cell one (555 against 29), 2.6x end to end on RANS and 4-7x at matched
+  residual levels.
 - **No relaxation tuning.** There are no pressure-velocity relaxation factors
   to choose, and therefore none to get wrong. The independent prototype
   diverges as SIMPLE at 0.85 / 0.5 relaxation on a mesh where the coupled
@@ -869,34 +724,42 @@ epsilon into the block system is a documented future direction, not implemented.
   agreeing to 1e-10 or better.
 - **The answer does not depend on the solver settings.** Every converged
   configuration on the three-dimensional case agrees within 0.04 %, across
-  preconditioners, inner tolerances, rank counts, CPU and GPU.
+  preconditioners, inner tolerances, rank counts and backends.
 
-### 8.2 Where it loses
+### 7.2 Where it loses
 
-- **Wall clock at production tolerances**, on cases a segregated solver already
-  handles well. 2.2x behind on the 483k-cell unit cell (91-95 s against 41 s),
-  and a straight loss on the small two-dimensional through-flow cases (wall
-  ratios 0.44x and 0.27x).
+- **Wall clock below the crossover**, on small cases a segregated solver
+  already handles well: a straight loss on the two-dimensional through-flow
+  cases (wall ratios 0.44x and 0.27x) and no better than a tie at 269k cells
+  (0.93x). The 483k-cell unit cell is recorded at 2.2x behind (91-95 s against
+  41 s) with the configuration of Section 4, which predates the tuning of
+  Section 9 and has not been re-measured with it.
 - **RANS wall clock.** 389 s against 61 s on the 12k-cell RANS backward-facing
   step (both contended, same conditions), and a dead heat at best on the
   three-dimensional RANS case, where both solvers are lag-limited anyway.
-- **Per-case tuning moves from relaxation factors to the linear solver.**
-  `relTol` cannot be set once and forgotten: 1e-12 for small laminar, 1e-6 for
-  large laminar with pseudo-transient continuation, 1e-12 for small RANS, 1e-8
-  with a capped `maxLinearIter` for large RANS.
+- **Per-case tuning moves from relaxation factors to the linear solver.** A
+  fixed `relTol` cannot be set once and forgotten: 1e-12 for small laminar,
+  1e-6 for large laminar with pseudo-transient continuation, 1e-12 for small
+  RANS, 1e-8 with a capped `maxLinearIter` for large RANS. `adaptiveTolerance`
+  removes that choice for the large three-dimensional laminar case, where it
+  also outperforms every fixed value tried, but the shipped configuration for
+  such a case is still a page of `petscOptions` (Section 9.2) rather than a
+  default.
 - **No universal preconditioner.** ASM/ILU and Schur+GAMG each fail where the
   other works; only Schur+hypre passed every topology tested, and it is the
   default precisely for that reason.
-- **No GPU speedup on workstation-class hardware.** The device path is exact
-  and fully functional but ties the CPU at best on the hardware measured.
 - **Memory.** The block system is four times the unknowns of any single
   segregated equation, and the Eigen direct backend is unusable in three
   dimensions.
 
-### 8.3 When should I use this solver?
+### 7.3 When should I use this solver?
 
 Reach for it when:
 
+- the case is a three-dimensional laminar mesh of roughly 300k cells or more
+  and wall clock is the objective - that is where the crossover sits, and above
+  a million cells the tuned configuration of Section 9.2 wins by a factor of
+  two or more;
 - the segregated solver stalls, oscillates, or needs aggressive
   under-relaxation to stay alive on the case;
 - the results must be converged much more deeply than SIMPLE's residual floor,
@@ -910,15 +773,338 @@ Reach for it when:
 
 Stay with the segregated solver when:
 
-- the case is a well-behaved laminar or RANS problem that SIMPLE already
-  converges in a few hundred iterations, and total wall clock is the objective;
+- the case is small - two-dimensional, or three-dimensional below a few hundred
+  thousand cells - and SIMPLE already converges it in a few hundred iterations,
+  and total wall clock is the objective;
 - the case is RANS at production accuracy - the lagged turbulence caps what the
   coupled pressure-velocity solve can buy;
 - the case needs anything outside this solver's scope: transient, compressible,
   multiphase, energy, `fvModels`, `fvConstraints` or MRF.
 
 
-## 9. Reproducing these results
+## 8. Scale-up: 2.15 million cells, 8.6 million unknowns
+
+A structured three-dimensional interrupted-fin duct, 2 150 400 hexahedral cells
+(400 x 100 x 56 with four staggered fins carved out), laminar at Re ~ 500,
+symmetry side walls, zero mesh non-orthogonality. Ten MPI ranks for both
+solvers, identical mesh, schemes and `residualControl` (`p` 1e-4, `U` 1e-5).
+The coupled system carries 8 601 600 unknowns, 4.5 times the case of Section 4.
+The rows below are the first measurement at this size, with the configuration as
+it stood then; Section 9 revisits the same case and the same mesh with a tuned
+one and supersedes the wall-clock conclusion drawn here.
+
+| | Segregated | Coupled (`a11` Schur, pseudo-transient, `relTol` 1e-6) |
+| --- | --- | --- |
+| Outer iterations | 555 (formal convergence) | 19-20 to the same streamwise and pressure targets |
+| Wall clock | 480 s | 1112 s at iteration 20; 1236 s for the full 60-iteration run |
+| Final residuals | U 5.4e-6, p 5.6e-6 | Ux 6.7e-7, p 2.0e-7; Uy 1.3e-5, Uz 1.1e-5 |
+| dP (kinematic) | 0.96269858 | 0.96256354 (**0.014 %** apart) |
+| sum abs div(phi) | - | 1.0e-7 (1.2e-9 normalised) |
+| Peak resident memory | - | 37.5 GB across ten ranks |
+
+Field agreement over all 2 150 400 cells: max cell-wise velocity difference
+5.15e-2 against a field maximum of 1.68 (3.1 %, localised at fin corners), rms
+difference 1.28e-3, that is 0.076 % of the field maximum. The localisation and
+the size ratio between max and rms are the signature of the Rhie-Chow damping
+difference of Section 2.3, not of a discretisation disagreement.
+
+**Iteration independence holds at scale.** Refining from the 483k-cell case of
+Section 4 to this one, a factor 4.5 in cells, moved the segregated count from
+142 to 555 (a factor 3.9) while the coupled count moved from 24 to 20. The
+coupled outer count is set by the nonlinearity, not by the mesh.
+
+**Wall-clock ratio, as this configuration left it.** The coupled solver was 2.2
+times slower than segregated at 483k cells and is 2.3 times slower here, and at
+the time that pair of numbers looked like a scaling law: the cost of one coupled
+iteration appeared to grow faster than linearly with problem size, the Krylov
+iteration count per outer solve rising with the system and cancelling the
+growing iteration-count advantage. It was a tuning state and not a scaling law.
+The 1112 s in the table above is an untuned baseline - a fixed inner tolerance,
+a full preconditioner rebuild every outer iteration, restarted FGMRES, and a
+Schur-block AMG left on its two-dimensional defaults - and each of those is
+worth a large factor at this size. Section 9 takes the same case and the same
+mesh to 203 s against the segregated solver's 478 s, and Section 9.4 places the
+crossover near 300k cells rather than beyond reach. The measurements in this
+section stand; the conclusion drawn from them does not.
+
+**Cost profile.** Almost all the time is spent early: iterations 1-10 cost 762 s
+of the 1236 s total, iteration 19 is reached at 1095 s, and the marginal cost of
+iterations 30-60 is 1.5 s each, because the solution has stopped changing and
+each inner solve converges immediately.
+
+**Transverse components set the stopping criterion.** `Ux` and `p` fall 20-50
+times below their targets while `Uy` and `Uz` plateau just above `1e-5` (1.3e-5
+and 1.1e-5). In a strongly directional flow the transverse residual
+normalisation divides by a near-zero reference response, so those components
+stall at a floor that has no bearing on the solution: the fields are frozen to
+four significant figures from iteration 30 onwards. Judge such a case on the
+streamwise component and the pressure, or set a looser tolerance for the
+transverse components. The tuned configuration of Section 9 does meet `U` 1e-5
+on all three components on this case, so the plateau recorded here belongs to
+the stalled inner-solve configuration above rather than to the geometry; the
+normalisation argument still explains why the transverse components are the
+last to fall.
+
+### 8.1 Preconditioner choice at this size
+
+Screening at 8.6 million unknowns, three outer iterations each:
+
+| `-pc_fieldsplit_schur_precondition` / preconditioner | s per outer iteration |
+| --- | --- |
+| `a11` + BoomerAMG (own pressure block) | **98.7** |
+| ASM(1) / ILU(1) | 112.3 |
+| `selfp` + BoomerAMG, `relTol` 1e-3 | 278 |
+| `selfp` + BoomerAMG, `relTol` 1e-6 (shipped default) | 555 |
+
+The shipped `selfp` default forms an explicit sparse matrix product for the
+Schur approximation and rebuilds it every outer iteration; at this size that
+product dominates the solve. The `a11` option uses the solver's own implicit
+pressure-Laplacian block instead, which costs nothing to form and, on this
+mesh, converges the same. All four reach the same residual after three
+iterations, so the difference is cost rather than convergence quality.
+
+
+## 9. Beating the segregated solver: the tuned large-case configuration
+
+On the 2 150 400-cell case of Section 8 (8 601 600 unknowns, ten MPI ranks) a
+tuned configuration converges in **203 s against the segregated solver's 478 s**
+- 2.3 times faster - with the same accuracy. Both numbers are reproducible: the
+coupled run was repeated back to back at 203 s / 203 s, and the segregated
+reference at 480 s / 478 s.
+
+| | Segregated | Coupled, tuned |
+| --- | --- | --- |
+| Outer iterations | 555 | **29** |
+| Wall clock | 478 s | **203 s** |
+| Converged | yes | yes |
+| dP | 0.96269619 | 0.96255897 (0.014 %) |
+| Velocity field, all 2.15M cells | - | rms difference 1.26e-3 = 0.075 % of the field maximum |
+
+The field difference is the same as the one produced by a slow, tightly solved
+run (1.28e-3), so the speed comes from the linear algebra and not from a
+looser answer. The normalised `sum|div(phi)|` is about 1e-9, as in Section 8.
+
+The two solver settings this configuration relies on are both off by default -
+`adaptiveTolerance no`, and `pcReuseInterval 1`, which rebuilds the
+preconditioner every outer iteration - so nothing in Sections 2 to 9 is
+affected by their existence and every number in them stands as measured.
+
+### 9.1 How the factor of 5.5 was obtained
+
+Starting from the Section 8 configuration at 1112 s, four independent changes
+compound. Each was measured separately on the same case:
+
+| Change | Wall clock | Why |
+| --- | --- | --- |
+| Section 8 baseline (`a11`, fixed `relTol` 1e-6) | 1112 s | did not satisfy the convergence test at all |
+| `adaptiveTolerance yes`, `relTolMax` 1e-2 | 710 s | stops over-solving early iterations; **also fixes the convergence stall** |
+| `pcReuseInterval 3` | 665 s | the AMG hierarchy no longer rebuilt every outer iteration |
+| `-ksp_type fbcgs` instead of restarted FGMRES | 556 s | removes orthogonalisation against a 30-vector basis of 8.6M unknowns |
+| 3-D tuning of the Schur-block AMG | 354 s | see below - the single largest lever |
+| `pcReuseInterval 8` | **203 s** | cheap V-cycles make a longer reuse interval pay |
+
+**Why the adaptive tolerance also fixes the stall.** The forcing term is an
+Eisenstat-Walker ratio of successive nonlinear block residuals, clamped to
+`relTolMin` and `relTolMax`, and it is defined against the current iterate, so
+the adaptive path additionally switches the inner convergence test to the
+initial-residual norm. That switch is not cosmetic: under PETSc's default test,
+which is relative to the norm of the right-hand side, a warm-started loose solve
+satisfies its tolerance before it takes a single Krylov step, and the outer loop
+stops moving. The fixed-`relTol` path is unchanged and still uses the default
+test.
+
+**The Schur-block AMG was running on two-dimensional defaults.** PETSc's
+BoomerAMG default `strong_threshold` is 0.25; hypre's own guidance for
+three-dimensional problems is 0.5, and the lower value marks far too many
+connections as strong, inflating operator complexity and the cost of every
+V-cycle. Correcting that, with cheaper HMIS coarsening and truncated `ext+i`
+interpolation, cut the run from 556 s to 354 s. Once each cycle was cheap, a
+longer preconditioner reuse interval became profitable and took it to 203 s.
+Reuse interval 8-12 is the optimum (206 s at 12, 238 s at 16).
+
+### 9.2 The configuration
+
+```c
+COUPLED
+{
+    nOuterIterations    80;
+    pseudoTransient     yes;
+    pseudoCo            50;
+
+    adaptiveTolerance   yes;
+    relTolMax           3e-2;
+    relTolMin           1e-8;
+    adaptiveGamma       0.9;
+    adaptiveAlpha       1.5;
+
+    pcReuseInterval     8;
+    maxLinearIter       500;
+
+    petscOptions
+        "-ksp_type fbcgs \
+         -pc_type fieldsplit -pc_fieldsplit_type schur \
+         -pc_fieldsplit_schur_fact_type upper \
+         -pc_fieldsplit_schur_precondition a11 \
+         -pc_fieldsplit_0_fields 0,1,2 -pc_fieldsplit_1_fields 3 \
+         -fieldsplit_0_ksp_type preonly -fieldsplit_0_pc_type bjacobi \
+         -fieldsplit_0_sub_pc_type ilu \
+         -fieldsplit_1_ksp_type preonly \
+         -fieldsplit_1_pc_type hypre -fieldsplit_1_pc_hypre_type boomeramg \
+         -fieldsplit_1_pc_hypre_boomeramg_strong_threshold 0.5 \
+         -fieldsplit_1_pc_hypre_boomeramg_coarsen_type HMIS \
+         -fieldsplit_1_pc_hypre_boomeramg_interp_type ext+i \
+         -fieldsplit_1_pc_hypre_boomeramg_P_max 4 \
+         -fieldsplit_1_pc_hypre_boomeramg_truncfactor 0.3 \
+         -fieldsplit_1_pc_hypre_boomeramg_agg_nl 1 \
+         -fieldsplit_1_pc_hypre_boomeramg_relax_type_all SOR/Jacobi";
+
+    residualControl { U 1e-5; p 1e-4; }
+}
+```
+
+A `petscOptions` string that spans several lines **must** end each continued
+line with a backslash. OpenFOAM's dictionary parser reads the value as a single
+quoted token and rejects a bare newline inside it with
+
+```text
+--> FOAM FATAL IO ERROR:
+found '\n' while reading string "-ksp_type fgmre..."
+```
+
+which is easy to mistake for a solver problem rather than a formatting one.
+Writing the whole string on one long line is equally valid and never fails.
+
+Use it for three-dimensional cases of roughly a million cells and up. On small
+two-dimensional cases the shipped defaults remain the better choice: the
+adaptive ceiling of 3e-2 is too loose there (see doc/USAGE.md), and neither
+preconditioner reuse nor the 3-D AMG settings pay when the hierarchy is cheap.
+
+### 9.3 Monolithic block AMG: measured and rejected
+
+Reproducing a Fluent-style monolithic coupled AMG through hypre and PETSc was
+tried and does not compete on this system. All runs used
+`-pc_hypre_boomeramg_numfunctions 4`, without which PETSc leaves hypre at
+`num_functions = 1` and every systems-AMG option silently degenerates; every
+run also carried `-options_left`, which reported no unused options.
+
+| Preconditioner | s per outer iteration | Residual after 3 outer iterations |
+| --- | --- | --- |
+| Schur `a11` (adopted) | 98.7 | 0.037 |
+| hypre nodal, block interpolation + nodal Schwarz smoother | 363-370 | 0.058-0.061 |
+| hypre nodal systems-AMG (Frobenius) | 389 | 0.977 |
+| hypre nodal systems-AMG (row sum) | 684 | 0.968 |
+| GAMG, unsmoothed aggregation + block Jacobi | fails | diverges with NaN on the first application |
+| Best block AMG plus diagonal equation scaling | 292 | 0.114 |
+
+The architecture is sound - block interpolation with a block smoother improves
+the three-iteration residual sixteen-fold over plain nodal coarsening on the
+same matrix - but through generic library components it costs three to four
+times more per iteration than the Schur splitting. A competitive monolithic
+block AMG needs purpose-built coarsening, interpolation and smoothers, which is
+a solver project rather than a configuration change.
+
+
+### 9.4 Where the crossover sits: a four-point size sweep
+
+The same interrupted-fin geometry meshed at four resolutions, both solvers at
+their best settings, ten MPI ranks throughout, identical convergence criteria
+(`U` 1e-5, `p` 1e-4). Every run formally converged.
+
+| Cells | Segregated | Coupled (tuned, 9.2) | Speed ratio | dP agreement | Field rms |
+| --- | --- | --- | --- | --- | --- |
+| 269k | 221 it / 13 s | 21 it / 14 s | 0.93x (tie) | 0.18 % | 0.12 % |
+| 533k | 296 it / 44 s | 24 it / 35 s | **1.3x coupled** | 0.12 % | 0.090 % |
+| 1.07M | 404 it / 149 s | 25 it / 75 s | **2.0x coupled** | 0.063 % | 0.074 % |
+| 2.15M | 555 it / 478 s | 29 it / 203 s | **2.3x coupled** | 0.014 % | 0.075 % |
+
+Two clean scaling laws produce the crossover. The segregated iteration count
+grows with resolution (221 -> 296 -> 404 -> 555) while the coupled count is
+essentially flat (21 -> 24 -> 25 -> 29), so the coupled advantage compounds
+with size; the crossover on this hardware sits near **300k cells**, and above a
+million cells the tuned coupled solver wins by a factor of two or more. The
+pressure-drop and field agreement *improve* with refinement (0.18 % down to
+0.014 %), consistent with the O(h^2) Rhie-Chow damping attribution of
+Section 2.3.
+
+
+### 9.5 Heat transfer: the advantage roughly doubles
+
+The same 2 150 400-cell duct with the energy equation active: inlet 300 K, all
+walls and fins isothermal at 350 K, Pr 0.71, laminar. The segregated reference is
+`foamRun` with `incompressibleFluid` plus a `scalarTransport` function object
+carrying the identical discrete temperature equation (constant diffusivity
+`nu/Pr`); the coupled solver uses `solveEnergy yes`. Both legs use the same
+temperature linear-solver settings, both were run exclusively under a lock, and
+both converged.
+
+| | Ranks | Outer | Temperature solves | Wall clock | dP | Bulk temperature rise |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| Segregated | 10 | 555 | 555 | **1099 s** | 0.96269533 | 14.86343 K |
+| **Coupled** | 10 | 29 | 28 | **245 s** | 0.96255905 | 14.86796 K |
+| Coupled | 20 | 28 | 27 | 250 s | 0.96255657 | 14.86796 K |
+
+**Coupled is 4.5 times faster than segregated with heat transfer on**, against
+2.3 times for the same case without it. The mechanism is the mesh-independent
+outer count: a segregated run solves the temperature equation once per SIMPLE
+iteration and therefore pays for 555 of them, while the coupled run pays for 28.
+Each additional transported scalar - a species, a second temperature, a tracer -
+is solved once per outer iteration in both codes, so each one widens the gap
+again by the same ratio.
+
+Accuracy is unaffected. The bulk temperature rise agrees to **0.031 %**
+(14.86343 K against 14.86796 K), the peak temperature to four significant
+figures (349.127 K against 349.124 K), and dP to 0.014 % as in the isothermal
+case. The coupled bulk rise is identical to five decimals across ten ranks and
+twenty ranks.
+
+**Do not over-solve the temperature equation.** These numbers were first
+measured with `T { tolerance 1e-12; relTol 0; }`, which is the right setting for
+the validation work of `doc/VALIDATION.md` and badly wrong for production: the
+convergence target is `residualControl T 1e-6`, so on later outer iterations the
+*initial* residual was already below target and the solver still spent 62 to 104
+inner iterations driving it to 1e-13. Switching to `relTol 0.01` cuts that to 16
+to 19 inner iterations, changes the answer in no digit reported above, and is
+worth a factor of **2.2 on the segregated leg** (2366 s to 1099 s) and 1.3 on the
+coupled one (322 s to 245 s). It costs the segregated solver more because it
+repeats the waste 555 times rather than 28. Treat `T` like `p` and `U`: a loose
+relative tolerance, with the outer `residualControl` deciding convergence.
+
+
+### 9.6 Rank scaling, and what did not work
+
+All rows below are single exclusive runs on the 2 150 400-cell case under the
+lock described in Section 1.
+
+**Neither solver benefits from more than about six cores.**
+
+| Ranks | Coupled, tuned | Segregated |
+| ---: | ---: | ---: |
+| 6 | 213 s | - |
+| 10 | 218 / 214 s | 488 s |
+| 16 | 235 s | - |
+| 20 | 216 s | 492 s |
+
+The coupled solver is flat from 6 to 20 ranks and the segregated one from 10 to
+20. Both saturate memory bandwidth well before ten cores on this machine, so the
+coupled solver delivers its full advantage on **six cores** and the remaining
+cores are better spent running further cases concurrently than adding ranks to
+one case. Outer-iteration counts are unchanged across the range (28-29 coupled,
+555-556 segregated), so this is a hardware limit and not an algorithmic one.
+
+**Options-only tuning beyond the configuration of Section 9.2 produced
+nothing.** A sweep of aggressive-coarsening levels, strength threshold 0.5 to
+0.7, interpolation truncation `P_max` 2 to 5, hypre's l1-Gauss-Seidel smoother
+in place of hybrid SOR, `KSPFBCGSR` in place of `KSPFBCGS`, and RCM renumbering
+all landed within the 5 % session spread of the baseline. Two of those arms did
+not test what they appeared to: `-pc_hypre_boomeramg_agg_interp_type` **is not a
+PETSc option** and `-fieldsplit_0_pc_factor_mat_ordering_type` needs a `sub_`
+prefix to reach a `bjacobi` sub-preconditioner. Both were reported by
+`-options_left`, which is the reason to pass it on every exploratory run: a
+misspelled PETSc option is silently ignored and produces a convincing null
+result.
+
+
+## 10. Reproducing these results
 
 `./Allrun` at the repository root builds nothing and runs every tutorial,
 printing a pass/fail summary; each tutorial can also be run on its own from its
@@ -931,15 +1117,20 @@ the tables above.
 | Section 3 cavity 128x128 and 256x256 rows | Lid-driven cavity, refined | `tutorials/cavity` with the `blockMeshDict` cell counts doubled or quadrupled |
 | stripChannel Re 400 and Re 1000 | 2-D periodic interrupted-fin channel | `tutorials/stripChannel` (Re 1000 as shipped; Re 400 by raising `nu` in `constant/physicalProperties`) |
 | Section 2.2 three-dimensional duct rows | Interrupted-fin duct, ~12k cells | `tutorials/finnedDuct` |
-| Section 7.5 kOmegaSST rows | 2-D interrupted-fin channel, kOmegaSST | `tutorials/stripChannelRAS` |
+| Section 6.5 kOmegaSST rows | 2-D interrupted-fin channel, kOmegaSST | `tutorials/stripChannelRAS` |
 | Section 2.4 and 3.4 prototype rows | Independent 2-D finite-volume code | `tools/reference_prototype/coupled_vs_simple.py`; needs Python 3 with NumPy and SciPy, no OpenFOAM |
-| Backward-facing step rows (laminar, Sections 7.1-7.3 kEpsilon) | Backward-facing step | **Not shipped** - reproducible from the stock OpenFOAM `pitzDaily` `blockMesh` resource, see below |
-| Sections 4, 6, 7.4 rows | 483k-cell interrupted-fin unit cell | **Not distributable** - see below |
+| Backward-facing step rows (laminar, Sections 6.1-6.3 kEpsilon) | Backward-facing step | **Not shipped** - reproducible from the stock OpenFOAM `pitzDaily` `blockMesh` resource, see below |
+| Sections 4, 5 and 6.4 rows | 483k-cell interrupted-fin unit cell | **Not distributable** - see below |
+| Sections 8, 9 rows | Structured interrupted-fin duct, 269k to 2.15M cells | **Not shipped** - a hexahedral duct with staggered fins carved out, meshed at four resolutions, see below |
 
 **What is not in the repository.** The 483k-cell unit-cell mesh is a
 `snappyHexMesh` result of several hundred megabytes and is not distributable,
-so Sections 4, 6 and 7.4 are reported as measurements rather than as
-reproducible tutorials. The backward-facing step is not shipped either: its
+so Sections 4, 5 and 6.4 are reported as measurements rather than as
+reproducible tutorials. The structured duct of Sections 8 and 9 is not
+shipped for the opposite reason: it is trivially describable, a hexahedral duct
+with four staggered fins carved out at 400 x 100 x 56 cells in its finest
+resolution, but that resolution needs ten ranks and 37.5 GB of memory, which is
+not a tutorial. The backward-facing step is not shipped either: its
 mesh comes from the stock OpenFOAM `pitzDaily` `blockMesh` resource, which any
 OpenFOAM installation already provides, and the case is a standard steady
 incompressible setup on that mesh. Everything those sections claim about the solver's
@@ -947,10 +1138,6 @@ behaviour that can be shown on a distributable case - iteration counts
 independent of mesh size and rank count, preconditioner-independent answers,
 the effect of the inner tolerance, the Rhie-Chow damping attribution - is also
 shown on the two-dimensional tutorials.
-
-The GPU rows additionally require a CUDA-enabled PETSc build (see
-`doc/INSTALL.md`) and are specific to the hardware and platform described in
-Section 6.
 
 **Running a comparison.** Both solvers read the same case directory, so a
 comparison is two runs and a diff:

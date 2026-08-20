@@ -130,7 +130,7 @@ neither the iteration count nor the last digits of Δp are identical between
 serial and parallel: the operator changes with `nut` between outer iterations,
 so the small difference between an exact direct solve and a PETSc solve at
 `relTol 1e-8` shifts the path slightly, and repeated 4-rank runs vary in the
-eighth digit of Δp. Treat the counts as *approximately* 140–150 and Δp as
+eighth digit of Δp. Treat the counts as *approximately* 130–150 and Δp as
 **0.793102 ± 1e-6**; only a larger departure indicates a real change.
 
 The serial figures are reproducible to every printed digit and are the ones

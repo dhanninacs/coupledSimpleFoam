@@ -101,7 +101,7 @@ Both are already in `Allrun`; both are easy to lose when adapting the case.
 2. **Copy `0.orig` to `0` only after meshing.** `subsetMesh` subsets whatever
    fields are in the current time directory; the mesh utilities need no `0`
    directory at all. It costs nothing here and is mandatory in
-   `../stripChannelRAS`, so all four tutorials follow the same recipe.
+   `../stripChannelRAS`, so all five tutorials follow the same recipe.
 
 ## Expected outcome
 
@@ -123,7 +123,7 @@ Segregated reference on the identical mesh and schemes: **195 iterations**,
 
 The `sum|div(phi)|` difference between the two backends is expected and is not
 a discretisation difference: the serial direct solve is exact to round-off,
-while the PETSc iterative solve stops at `relTol 1e-8`. Both are far below any
+while the PETSc iterative solve stops at the shipped default `relTol 1e-12`. Both are far below any
 level that affects the answer, as the identical pressure drop shows.
 
 ## Runtime

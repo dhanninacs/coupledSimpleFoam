@@ -258,6 +258,14 @@ magnitude. **The default remains $\gamma = 1$**, which is the consistent choice
 for a solver that has no relaxation factor; $\gamma = \alpha_U$ is a verification
 setting.
 
+**The $O(h^2)$ attribution is testable under refinement, and it holds.** One
+three-dimensional interrupted-fin duct geometry meshed at four resolutions, with
+both solvers run to convergence at their own best settings, gives a
+pressure-drop difference of 0.18 %, 0.12 %, 0.063 % and 0.014 % at 269k, 533k,
+1.07M and 2.15M cells. The two converged answers approach each other
+monotonically as the mesh is refined, which is what a discretisation difference
+must do and what a solver error would not.
+
 ---
 
 ## 3. Collocated grids and Rhie-Chow interpolation
@@ -969,6 +977,22 @@ whereas SIMPLE does: SIMPLE's amplification comes from dropping the off-diagonal
 momentum coupling, whose relative weight grows with refinement, while the coupled
 loop's comes from lagging a term that scales with the operator it approximates.
 
+The sharpest form of the test is one three-dimensional geometry meshed at four
+resolutions, with both solvers at their best settings, the same ten ranks and the
+same convergence criteria throughout:
+
+| cells | segregated outer iterations | coupled outer iterations |
+|---|---|---|
+| 269k | 221 | 21 |
+| 533k | 296 | 24 |
+| 1.07M | 404 | 25 |
+| 2.15M | 555 | 29 |
+
+An eightfold increase in cell count costs the segregated solver a factor 2.5 in
+iterations and the coupled loop a factor 1.4. Growth laws that different must
+eventually cross in wall clock as well, and §9.1 records where they do on the
+hardware measured.
+
 ---
 
 ## 7. Turbulence
@@ -1108,6 +1132,11 @@ solver's RANS niche is a deeper residual floor at equal compute — measured
 4.7$\times$ deeper in $u_x$ on the 3-D interrupted-fin unit cell, where both
 solvers lag-floor.
 
+The laminar large-mesh crossover of §9.1 does **not** carry over to RANS, and the
+reason is the one above: where the turbulence lag sets the floor, a faster
+pressure-velocity solve has nothing left to buy. SIMPLE remains the production
+choice for RANS.
+
 A second, milder consequence: because $\nu_{\mathrm{eff}}$ is heterogeneous in a
 RANS field, both the velocity-block preconditioner and the Schur approximation
 degrade, so the inner solve becomes markedly more expensive than in laminar cases
@@ -1155,7 +1184,9 @@ completing one outer iteration. Scalar BoomerAMG on the whole system diverges at
 the 5000-iteration inner cap. By contrast, hypre's **nodal** (systems) AMG, which
 does respect the block structure, converges on the same problem to the
 direct-solve reference at 2361 inner iterations — evidence that the obstacle is
-the block/indefinite structure, not the size.
+the block/indefinite structure, not the size. That observation is followed up in
+§8.5, where the nodal route is taken as far as generic library components allow
+and costed against the splitting.
 
 ### 8.3 Field-split and Schur-complement preconditioning
 
@@ -1178,9 +1209,8 @@ split is coded, and everything is switchable from the `petscOptions` string.
 
 The velocity block is handled by block-Jacobi with sub-domain ILU: adequate,
 because $\mathrm{F}$ is a well-behaved convection-diffusion operator. Replacing it
-with plain Jacobi nearly doubles the inner iteration count, and replacing its ILU
-with a device-resident variant is worth $0.01$ s per outer iteration — the
-velocity block is not where the time goes.
+with plain Jacobi nearly doubles the inner iteration count — the velocity block
+is not where the time goes.
 
 ### 8.4 SIMPLE-type Schur approximations
 
@@ -1210,6 +1240,26 @@ variant reaches the same answer with no gain, and least-squares commutator (LSC)
 preconditioning converges but at 211 s per outer iteration, roughly 40$\times$ the
 target.
 
+**At scale, forming $\widehat{\mathrm{S}}$ costs more than solving with it.**
+`selfp` builds the matrix product
+$\mathrm{D}\,\mathrm{diag}(\mathrm{F})^{-1}\mathrm{G}$ explicitly, and rebuilds it
+every outer iteration because $\mathrm{F}$ changes every outer iteration. At
+8.6M unknowns that rebuild drives the cost to 555 s per outer iteration.
+PETSc's `a11` option instead preconditions the Schur block with the $(2,2)$ block
+the assembly already holds, which here is the compact Rhie-Chow Laplacian
+$\mathrm{C}$ — nothing is formed, and the cost falls to 98.7 s per outer
+iteration, 5.6$\times$ less; ASM with sub-domain ILU sits between the two at
+112 s. The approximation is not as crude as dropping a term sounds: under the
+same heuristic assumptions as §6.5, $\mathrm{S} \approx 2\,\mathrm{L}^{\mathrm{c}}$
+while $\mathrm{C} = \mathrm{L}^{\mathrm{c}}$, so in the smooth modes `a11` is the
+Schur complement up to a scalar factor of about two, and a uniform rescaling of a
+preconditioner shifts the spectrum without spreading it. `selfp` remains the
+shipped default because it is the more robust of the two on small and strongly
+non-orthogonal meshes, where $\mathrm{C}$ alone is a poorer stand-in for
+$\mathrm{S}$; the tuned large-case configuration in
+[`BENCHMARKS.md`](BENCHMARKS.md) switches to `a11`, paired with the `upper`
+rather than the `full` factorisation.
+
 ### 8.5 Block AMG in the literature, and why it is not used here
 
 The alternative to splitting is a multigrid method built for the coupled system
@@ -1223,16 +1273,68 @@ coupled solvers (arXiv:2403.07882); ICSFoam as an example of coupled AMG with
 block-ILU smoothers; and Notay's pairwise/double-pairwise aggregation (Notay
 2010) as an architecture with intrinsically cheap setup.
 
-This solver does not implement one. It delegates to PETSc's generic components,
-for which the honest reason is a measurement: **preconditioner reuse is
-counterproductive here.** Freezing the preconditioner across outer iterations
-costs $+53\%$ wall clock on the 483k-cell case (392.7 s against 257.3 s), and
-freezing only the hierarchy structure costs $+66\%$. The Picard operator evolves
-fast enough between iterations that a stale preconditioner costs more inner
-iterations than its setup saves. Any block-AMG work would therefore have to make
-*fresh setup intrinsically cheap* rather than amortise setup across iterations —
-which is exactly the design point of pairwise aggregation, and exactly what the
-smoothed-aggregation and classical hierarchies do not offer.
+This solver does not implement one, and the reason is no longer an extrapolation
+from that literature. The architecture was built out of hypre and PETSc
+components and measured against the Schur splitting on the same matrix, at 8.6M
+unknowns, recording the cost of an outer iteration and the residual reached after
+three of them:
+
+| preconditioner | s per outer iteration | residual after 3 outer iterations |
+|---|---|---|
+| Schur `a11` (adopted, §8.4) | 98.7 | 0.037 |
+| hypre nodal, block interpolation $+$ nodal Schwarz smoother | 363-370 | 0.058-0.061 |
+| hypre nodal systems-AMG (Frobenius) | 389 | 0.977 |
+| hypre nodal systems-AMG (row sum) | 684 | 0.968 |
+| GAMG, unsmoothed aggregation $+$ block Jacobi | fails | diverges with NaN on the first application |
+| best block AMG $+$ diagonal equation scaling | 292 | 0.114 |
+
+The residual column should be read first, because it says the theory of §8.2 is
+right. Nodal coarsening on its own — a block strength measure, Frobenius or row
+sum, deciding the hierarchy, with interpolation and relaxation left pointwise —
+barely moves the residual in three outer iterations (0.977, 0.968). Respecting
+the $4\times4$ structure in the *transfer and the relaxation as well* — block
+interpolation plus a nodal Schwarz smoother — improves that residual
+**sixteenfold**, to 0.058-0.061, on the identical matrix. The architecture is
+directionally sound, and the improvement arrives exactly where §8.2 says it must:
+in the two places a saddle-point matrix defeats a scalar hierarchy.
+
+The cost column is what rejects it. Through generic library components the same
+architecture costs three to four times more per outer iteration than the
+splitting and still ends the third iteration at a worse residual, so it loses on
+both axes at once. Diagonal equation scaling narrows the gap on the block
+hierarchy, from 363 to 292 s, but is not a shared remedy: applied to the adopted
+`a11` configuration it doubles the cost, from 98.7 to 196.7 s.
+GAMG's unsmoothed aggregation with a block-Jacobi smoother does not survive at
+all, producing NaN on its first application (`KSP` converged reason $-9$).
+
+**One trap is worth recording, because it silently invalidates any attempt to
+repeat this: PETSc does not forward the matrix block size to hypre.**
+`MatSetBlockSize(A, 4)` — the same call that gives the field split its index sets
+for nothing (§4.1) — only sets the *default value* of an option whose hypre-side
+call is guarded by a "was this set" flag. Unless
+`-pc_hypre_boomeramg_numfunctions 4` is passed explicitly, hypre runs at
+`num_functions = 1` and every systems-AMG option quietly degenerates to its
+scalar equivalent, with no warning and no error: the run is then a
+scalar-AMG run wearing block-AMG options. Every run in the table above passed
+it, and every run also carried `-options_left`, which reported no unused options.
+
+The setup-cost argument that used to close this section survives in a narrower
+form. Freezing the preconditioner for a whole run is still counterproductive:
+$+53\%$ wall clock on the 483k-cell case (392.7 s against 257.3 s), and $+66\%$
+for freezing only the hierarchy structure, because the Picard operator evolves
+fast enough that a stale preconditioner costs more inner iterations than its
+setup saves. What that measurement does not license is the stronger reading, that
+setup can never be amortised. A *periodic* rebuild — `pcReuseInterval`, which
+refreshes on outer iterations $1, N+1, 2N+1, \ldots$ and reuses in between — is a
+different policy from a permanent freeze, and whether it pays is a ratio of setup
+cost to cycle cost rather than a property of the Picard loop alone. On the
+8.6M-unknown case an interval of 3 was worth 45 s while the Schur-block hierarchy
+was still running on two-dimensional AMG defaults; once that hierarchy was tuned
+for three dimensions and each V-cycle became cheap, an interval of 8 was worth a
+further 151 s, with the optimum at 8-12. A monolithic block AMG that competed
+here would therefore need cheap cycles as well as cheap setup — which is what
+purpose-built coarsening, interpolation and smoothers buy, and what generic
+components, as measured above, do not.
 
 ### 8.6 Preconditioner suitability is problem-dependent
 
@@ -1249,21 +1351,130 @@ behaviour is a clean mirror image:
 Each of the first two is robust exactly where the other fails. Only field-split
 Schur with hypre BoomerAMG on the Schur block passes every tested topology, which
 is why it is the shipped default. Replacing GAMG with BoomerAMG on the Schur block
-cut the inner iteration count from 188 to $\approx75$ and the cost from 19.95 to
-7.72 s per outer iteration — a 2.7$\times$ end-to-end speed-up from a one-line
-options change and no hardware.
+cut the inner iteration count from 188 to $\approx75$ and the cost from 12.2 to
+3.7-3.8 s per outer iteration — a 2.7$\times$ end-to-end speed-up from a one-line
+options change and no hardware. The last row of the table is that case class
+only; the same architecture pushed as far as generic components allow, on a
+much larger mesh, is costed in §8.5.
 
-The inner tolerance interacts with this choice and cannot be set once and
-forgotten, because the outer loop is a Picard iteration started from a nonzero
-guess: too loose an inner solve makes the linear update negligible and the outer
-loop stalls rather than converging slowly.
+Two further settings are problem-dependent in the same way. The **Schur
+approximation** itself changes with size: `selfp` for the small and awkward
+meshes it was chosen to be robust on, `a11` once forming the product dominates
+the solve (§8.4). And the **inner tolerance** cannot be set once and forgotten,
+because the outer loop is a Picard iteration started from a nonzero guess: too
+loose a fixed inner solve makes the linear update negligible and the outer loop
+stalls rather than converging slowly, for the reason dissected in §8.7.
 
 | regime | recommended `relTol` | rationale |
 |---|---|---|
 | small laminar (2-D) | $10^{-12}$ | $10^{-3}$ and $10^{-6}$ both fail to converge |
 | large laminar (3-D) with pseudo-transient | $10^{-6}$ | 1.9$\times$ faster than $10^{-12}$ at the same outer count; $10^{-4}$ costs more outer iterations than it saves |
+| multi-million-cell 3-D laminar | `adaptiveTolerance` with `relTolMax` $10^{-2}$ | at 8.6M unknowns a fixed $10^{-6}$ does not satisfy the convergence test at all; the schedule both removes that stall and cuts the run from 1112 to 710 s (§8.7) |
 | small RANS | $10^{-12}$ | at $10^{-6}$ discrete continuity degrades to $\sim10^{-9}$ and the outer loop does not finish |
 | large 3-D RANS | $10^{-8}$ with `maxLinearIter 500` | at $10^{-12}$ the turbulent matrix needs ~2340 inner iterations per outer solve |
+
+The fixed values in that table are a hand-tuned schedule; §8.7 is the theory of
+computing it instead.
+
+### 8.7 Inexact inner solves and the forcing term
+
+**Why an inexact inner solve is sound at all.** The linear system of §8.1 is not
+the problem being solved; it is one step of the Picard iteration that solves the
+nonlinear problem. The fixed point is defined by the *assembled* system — the
+residual $\mathbf{r} = \mathbf{b}^{n+1} - \mathrm{K}^{n+1}\mathbf{x}^{n}$ of §6.2,
+measured before the solve — and every quantity that enters it is rebuilt from
+$\mathbf{x}$ at the top of the next outer iteration. An inner solve that stops
+early therefore changes the step, not the destination, in exactly the sense §2.2
+claims for the preconditioner: it can slow the outer loop, or in the limit stop
+it moving, but it cannot move the answer. Accuracy in the inner solve is bought
+solely to make the outer loop contract, and any accuracy beyond that is spent on
+a linear system that the next assembly is about to replace.
+
+Making that quantitative is the inexact-Newton framework (Dembo, Eisenstat &
+Steihaug 1982). Writing the solve at outer iteration $n$ as
+$\mathrm{K}^n\mathbf{x} = \mathbf{b}^n$ started from $\mathbf{x}^{n-1}$, the step
+is accepted when
+
+$$
+\bigl\lVert \mathbf{b}^n - \mathrm{K}^n\mathbf{x}^{n} \bigr\rVert
+\;\le\; \eta_n \, \bigl\lVert \mathbf{b}^n - \mathrm{K}^n\mathbf{x}^{n-1} \bigr\rVert ,
+\qquad 0 \le \eta_n < 1 ,
+$$
+
+with $\eta_n$ the **forcing term**. That theory is stated for Newton and does not
+transfer verbatim to a Picard loop, but the shape of its conclusion is what
+matters here: forcing terms bounded away from one leave the outer convergence
+intact, while driving $\eta_n \to 0$ buys back at most the rate of the
+exact-solve method and never more. Eisenstat & Walker (1996) choose
+$\eta_n$ from the observed nonlinear residual reduction, which is what
+`adaptiveTolerance` implements:
+
+$$
+\eta_1 = \texttt{relTolMax},
+\qquad
+\eta_n = \gamma\left(\frac{\lVert\mathbf{r}^{n}\rVert}{\lVert\mathbf{r}^{n-1}\rVert}\right)^{\!\alpha}
+\quad (n \ge 2),
+$$
+
+safeguarded against over-loosening and clamped to $[\texttt{relTolMin},
+\texttt{relTolMax}]$, with $\gamma = 0.9$ and $\alpha = 1.5$ by default. The
+$\lVert\mathbf{r}^{n}\rVert$ driving it is the same normalised block residual the
+convergence test of §6.4 uses, reduced to one number by taking the worst block,
+so the schedule is tied to the quantity the run is judged on rather than to a
+second measure of progress.
+
+**What the Picard outer loop does to that schedule.** The outer loop here is
+Picard and not Newton (§6.1), so its exact-solve rate is linear, at the
+contraction factor of about $\tfrac12$ derived in §6.5. Substituting a constant
+contraction $\rho$ into the schedule returns a constant forcing term,
+$\eta = \gamma\rho^{\alpha} = 0.9\times0.5^{1.5} \approx 0.32$: on a well-behaved
+case the schedule does not ramp towards zero, because there is no superlinear
+outer convergence for it to track. That value sits above any sensible ceiling, so
+the clamp binds and the run effectively requests `relTolMax` on most iterations,
+with the schedule earning its keep where the loop momentarily converges faster or
+slower than its asymptotic rate. The practical corollary is that the *ceiling*,
+not the floor, decides the wall clock of a healthy run — and that a solver whose
+outer loop were Newton rather than Picard would get more out of the same
+schedule.
+
+**Why the forcing term must be measured against the current iterate's residual.**
+The inequality above compares two residuals of the *same* iterate sequence; the
+right-hand side is the residual the solve starts from. PETSc's default
+convergence test is not that. It is
+$\lVert\mathbf{r}_k\rVert \le \texttt{rtol}\,\lVert\mathbf{b}\rVert$, relative to
+the right-hand side. The outer loop warm-starts every solve from the previous
+solution (§6.1, step 5), so as the run converges
+$\lVert\mathbf{b}^n - \mathrm{K}^n\mathbf{x}^{n-1}\rVert$ falls orders of
+magnitude below $\lVert\mathbf{b}^n\rVert$, and a request of $\eta_n = 10^{-1}$
+read against $\lVert\mathbf{b}^n\rVert$ is **already satisfied by the initial
+guess**. The Krylov solver returns after zero iterations, having changed nothing;
+the outer loop is handed back its own input and stops moving. This is the precise
+mechanism behind the stall that §8.6 records for a fixed loose `relTol`, and it
+is why `relTolMax` $10^{-1}$ and `relTol` $10^{-1}$ are not the same request: the
+first asks each solve to reduce its own starting residual tenfold, which is real
+work, and the second usually asks for nothing.
+
+The adaptive path therefore switches the convergence test to the initial-residual
+norm (`KSPConvergedDefaultSetUIRNorm`), under which $\eta_n$ means what the
+inexact-Newton condition says it means. The switch is scoped to that path: with
+`adaptiveTolerance` off no tolerance is pushed to the backend at all, the fixed
+`relTol` keeps its $\lVert\mathbf{b}\rVert$-relative meaning, and the regimes
+tabulated in §8.6 keep their measured numbers.
+
+The effect is not marginal at scale. On the 2.15M-cell case a fixed `relTol`
+$10^{-6}$ failed to satisfy the convergence test at all in 1112 s; the schedule
+with `relTolMax` $10^{-2}$ both removed that stall and brought the run to 710 s,
+the first of the changes that took that case to 203 s (§9.1). The
+mechanism and the measurement agree: what the fixed tight tolerance was buying —
+inner accuracy far beyond the linearisation error of the step it was computing —
+was work the outer loop discarded.
+
+Finally, this is the second control that makes inexact solves safe, and the two
+are complementary rather than alternative. Pseudo-transient continuation (§6.3)
+bounds the size of a single update and strengthens the velocity block, so an
+inaccurate step cannot be amplified by the fixed-point map; the forcing term
+decides how inaccurate that step is allowed to be in the first place. The tuned
+large-case configuration uses both.
 
 ---
 
@@ -1290,12 +1501,41 @@ $8.8\times10^{-4}$, because the reference's own residual level is the larger err
 Pressure-drop agreement across the laminar suite is 0.17-0.38 % at production
 stopping criteria and 0.11 % on the 3-D unit cell once $D_f$ is matched.
 
-The behavioural difference the coupled formulation buys is not primarily speed. It
-is (i) no relaxation factors to tune and no divergence when they are set
-aggressively, (ii) outer iteration counts that do not grow under mesh refinement,
-and (iii) the ability to converge deeply on meshes where SIMPLE floors — on the
-3-D interrupted-fin unit cell the segregated solver never reaches $10^{-7}$ in
-8000 iterations, while the coupled solver reaches $8\times10^{-10}$ in 28.
+The behavioural differences the coupled formulation buys are (i) no relaxation
+factors to tune and no divergence when they are set aggressively, (ii) outer
+iteration counts that do not grow under mesh refinement, and (iii) the ability to
+converge deeply on meshes where SIMPLE floors — on the 3-D interrupted-fin unit
+cell the segregated solver never reaches $10^{-7}$ in 8000 iterations, while the
+coupled solver reaches $8\times10^{-10}$ in 28.
+
+**Wall clock is a consequence of (ii), and it therefore depends on size.** Across
+the four meshes of §6.5, each solver at its best settings on the same ten ranks:
+
+| cells | segregated | coupled, tuned | ratio |
+|---|---|---|---|
+| 269k | 13 s | 14 s | 0.93$\times$, a tie |
+| 533k | 44 s | 35 s | 1.3$\times$ coupled |
+| 1.07M | 149 s | 75 s | 2.0$\times$ coupled |
+| 2.15M | 478 s | 203 s | 2.3$\times$ coupled |
+
+A flat iteration count multiplied by an expensive iteration beats a growing
+iteration count multiplied by a cheap one once the mesh is large enough, and on
+this hardware the two lines cross near 300k cells. At the top of the sweep —
+2 150 400 cells, 8 601 600 unknowns, ten MPI ranks, laminar — the coupled solver
+converges in 29 outer iterations and 203 s against the segregated solver's 555
+iterations and 478 s. Both figures are reproducible back to back (203 s / 203 s
+and 480 s / 478 s), the pressure drops are 0.96255897 against 0.96269619
+(0.014 % apart), and the velocity fields differ over all 2 150 400 cells by an
+rms of $1.26\times10^{-3}$, 0.075 % of the field maximum. That is the same
+difference a slow, tightly solved run produces ($1.28\times10^{-3}$), so the
+speed is bought from the linear algebra and not from a looser answer.
+
+The tuned configuration this requires — `a11`, `fbcgs`, three-dimensional AMG
+settings on the Schur block, an adaptive inner tolerance and a preconditioner
+reuse interval (§8.4, §8.5, §8.7) — is written out in
+[`BENCHMARKS.md`](BENCHMARKS.md). It is a large-case configuration: below the
+crossover the shipped defaults are better, and on small two-dimensional cases the
+segregated solver remains the cheaper choice by some margin.
 
 ### 9.2 foam-extend `pUCoupledFoam`
 
@@ -1316,10 +1556,14 @@ continuation (User's Guide §37.3) in place of under-relaxation factors, and
 turbulence segregated. The differences are in the linear algebra rather than the
 formulation — a purpose-built coupled algebraic multigrid with block smoothers,
 tuned over a long period against a broad case base, where this solver delegates to
-generic PETSc components and compensates with Schur-complement splitting. That is
-the honest explanation both for why the coupled formulation behaves as the
-literature says it should here, and for why wall-clock parity with a mature
-segregated solver is not yet reached (§8.6).
+generic PETSc components and compensates with Schur-complement splitting. That
+choice was not made on principle and is not a placeholder: assembling the
+monolithic route out of the same generic components was measured to cost three to
+four times more per outer iteration than the splitting, at a worse residual
+(§8.5). The compensation is good enough that the formulation's mesh-independent
+iteration count survives into wall clock on large three-dimensional meshes
+(§9.1); what a purpose-built coupled multigrid would add is a cheaper iteration,
+not a different fixed point.
 
 ### 9.4 petsc4Foam and the PETSc external-solver module
 
@@ -1334,11 +1578,23 @@ petsc4Foam dependency.
 
 ### 9.5 Adaptive inner tolerances
 
-The inner-tolerance regimes of §8.6 are a hand-tuned substitute for an adaptive
-forcing-term strategy of the Eisenstat & Walker (1996) type, in which the inner
-tolerance is chosen from the observed outer residual reduction. This is an
-unexplored avenue for reducing inner-solve cost, and would directly address the
-one control the user currently cannot set once and forget.
+The inner-tolerance regimes of §8.6 began as a hand-tuned substitute for an
+adaptive forcing-term strategy of the Eisenstat & Walker (1996) type, in which
+the inner tolerance is chosen from the observed outer residual reduction. That
+strategy is now implemented as `adaptiveTolerance`, with the standard choice-2
+forcing term, the standard safeguard against over-loosening, and a clamp to a
+user-set window; §8.7 derives why an inexact inner solve is legitimate for this
+outer loop and what the Picard linearisation does to the schedule.
+
+The one departure from the textbook form is not in the schedule but in the norm
+it is enforced against. The literature states the condition relative to the
+residual of the current iterate, which is not what a Krylov library necessarily
+tests — PETSc's default is relative to $\lVert\mathbf{b}\rVert$ — and for an
+outer loop that warm-starts from the previous solution the two differ by orders
+of magnitude, to the point where the schedule silently degenerates into no inner
+work at all (§8.7). Implementations that carry the forcing term across from a
+cold-start nonlinear solver should check which norm their backend is using before
+concluding that the strategy does not help.
 
 ---
 

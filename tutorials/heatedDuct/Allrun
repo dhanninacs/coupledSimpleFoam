@@ -1,0 +1,117 @@
+#!/bin/sh
+#------------------------------------------------------------------------------
+# coupledSimpleFoam tutorial `heatedDuct` - mesh, solve and report, in serial.
+#
+# This file is part of coupledSimpleFoam and is distributed under the GNU
+# General Public License version 3; see the LICENSE file at the root of this
+# repository.
+#
+# Usage
+#     ./Allrun
+#
+# Runs in serial and takes well under a minute.  Exits non-zero if any step
+# fails, so the script is usable as a regression test.
+#------------------------------------------------------------------------------
+cd "${0%/*}" || exit 1
+
+if [ -z "$WM_PROJECT_DIR" ]
+then
+    echo "$0: the OpenFOAM environment is not set." 1>&2
+    echo "    Source the installation's etc/bashrc first, for example" 1>&2
+    echo "        . /opt/openfoam14/etc/bashrc" 1>&2
+    exit 1
+fi
+
+if ! command -v coupledSimpleFoam > /dev/null 2>&1
+then
+    echo "$0: coupledSimpleFoam is not on PATH." 1>&2
+    echo "    Build it with the repository's ./Allwmake first." 1>&2
+    exit 1
+fi
+
+# OpenFOAM's runApplication skips a step whose log file already exists and
+# swallows the application's exit status.  A tutorial that doubles as a
+# regression test needs neither behaviour, so use this wrapper instead: it
+# always runs, and it stops the script on the first failure.
+runApp()
+{
+    _app=$1
+    shift
+    echo "Running $_app on $PWD"
+    if ! "$_app" "$@" > "log.$_app" 2>&1
+    then
+        echo "$0: $_app FAILED; last 20 lines of log.$_app:" 1>&2
+        tail -20 "log.$_app" 1>&2
+        exit 1
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Mesh
+#------------------------------------------------------------------------------
+runApp blockMesh
+
+# Fields live in 0.orig and are copied into place after meshing, as in every
+# case here, so that the case can be re-run without a fresh checkout.
+rm -rf 0
+cp -r 0.orig 0
+
+#------------------------------------------------------------------------------
+# Solve
+#------------------------------------------------------------------------------
+runApp coupledSimpleFoam
+
+# The inlet pressure, and the cell centres the Nusselt post-processing needs
+runApp foamPostProcess -latestTime \
+    -func "patchAverage(patch=inlet,fields=(p))"
+mv log.foamPostProcess log.patchAverage
+
+runApp foamPostProcess -latestTime -func writeCellCentres
+
+#------------------------------------------------------------------------------
+# Report
+#------------------------------------------------------------------------------
+log=log.coupledSimpleFoam
+
+if ! grep -q "COUPLED solution converged" "$log"
+then
+    echo "$0: the solver did not converge; see $log" 1>&2
+    exit 1
+fi
+
+iters=$(sed -n 's/.*COUPLED solution converged in \([0-9][0-9]*\) iterations.*/\1/p' "$log")
+pIn=$(sed -n 's/.*areaAverage(inlet) of p = *//p' log.patchAverage | tail -1)
+latest=$(foamListTimes -latestTime 2>/dev/null | tail -1)
+
+energy=$(grep "coupled energy check" "$log" | tail -1)
+qWall=$(echo "$energy" | sed -n 's/.*wall heat flux = \([^,]*\),.*/\1/p')
+imbal=$(echo "$energy" | sed -n 's/.*imbalance = \(.*\) %.*/\1/p')
+
+# Stations 2, 4, 6 and 9 m; the tool snaps each to the nearest cell centre.
+# The headline value is taken at x = 8.975 m rather than at the last cell:
+# `zeroGradient` on T at the outlet forces the streamwise gradient to zero in
+# the final column, where it is physically still positive, which perturbs the
+# last few cells (7.5611 there against 7.5416 one metre upstream).
+nusselt=$(python3 ../../tools/heated_duct_nusselt.py . "$latest" 350 2 4 6 9 \
+          2>&1)
+nuLast=$(echo "$nusselt" | sed -n 's/^Nu at x = [0-9.]* : \([0-9.]*\) .*/\1/p')
+
+echo
+echo "===================================================================="
+echo "heatedDuct - plane channel with isothermal walls, Re = 20, Pr = 7"
+echo "--------------------------------------------------------------------"
+grep -m1 "Pressure level:"     "$log" | sed 's/^/  /'
+grep -m1 "Coupled p-U system:" "$log" | sed 's/^/  /'
+grep -m1 "alphaEff = "         "$log" | sed 's/^ */  /'
+echo "  Outer iterations to convergence : $iters   (expected 11)"
+echo "  Inlet-to-outlet pressure drop   : $pIn m^2/s^2   (expected 13.0918221595)"
+echo "  Net wall heat flux              : $qWall K m^3/s   (expected 1.7944553015)"
+echo "  Energy-balance imbalance        : $imbal %   (expected of order 1e-9)"
+echo "  Nusselt number at x = 8.975 m   : $nuLast   (expected 7.5416, exact 7.5407)"
+echo "--------------------------------------------------------------------"
+echo "$nusselt" | sed 's/^/  /'
+echo "===================================================================="
+
+[ "$iters" = "11" ] || echo "NOTE: iteration count differs from the reference value of 11."
+
+#------------------------------------------------------------------------------

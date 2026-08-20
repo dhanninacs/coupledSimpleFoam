@@ -1,0 +1,25 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "constant";
+    object      physicalProperties;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+viscosityModel  constant;
+
+// Re = U*Dh/nu = 1*2/0.1 = 20.  With Pr = 7 (COUPLED/Pr in system/fvSolution)
+// the Peclet number is Re*Pr = 140, high enough that axial conduction does not
+// shift the fully developed Nusselt number, while the hydrodynamic entry
+// length 0.05*Re*Dh = 2 m stays short compared with the 10 m domain.
+nu              0.1;
+
+// ************************************************************************* //

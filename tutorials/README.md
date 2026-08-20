@@ -1,13 +1,13 @@
 # coupledSimpleFoam tutorials
 
-Four self-contained cases for `coupledSimpleFoam`, the steady-state
+Five self-contained cases for `coupledSimpleFoam`, the steady-state
 incompressible solver that assembles momentum and continuity into a single
 implicitly coupled linear system (block size 4, unknowns interleaved
 `[u, v, w, p]` per cell).
 
 Each case runs on a fresh machine that has OpenFOAM 14 and this solver
 installed, and nothing else. Each carries its own `Allrun`, `Allclean` and
-`README.md`; the three flow-through cases also carry an `Allrun-parallel`.
+`README.md`; three of the flow-through cases also carry an `Allrun-parallel`.
 
 | Case | Cells | Physics | Demonstrates | Serial runtime |
 |---|---|---|---|---|
@@ -15,6 +15,7 @@ installed, and nothing else. Each carries its own `Allrun`, `Allclean` and
 | [`stripChannel`](stripChannel/) | 10 920 | 2-D interrupted-fin channel, Re = 1000, laminar | internal obstacles, inlet/outlet, `blockMesh` + `topoSet` + `subsetMesh`, MPI | a few seconds |
 | [`finnedDuct`](finnedDuct/) | 12 048 | 3-D duct with a fin, Re = 1000, laminar | 3-D, symmetry constraint patches, why the backend matters | about a minute |
 | [`stripChannelRAS`](stripChannelRAS/) | 10 920 | the 2-D channel with kOmegaSST | RANS setup: `k`/`omega`/`nut`, wall functions, `wallDist`, segregated residual controls | about a minute |
+| [`heatedDuct`](heatedDuct/) | 8 000 | plane channel with isothermal walls, Re = 20, Pr = 7, laminar | `solveEnergy`, thermal boundary conditions, the energy-balance log line, and the Nu = 7.54 physics gate | a few seconds |
 
 ## Running them
 
@@ -83,7 +84,7 @@ coupled assembly check: sum|div(phi)| = ...
 
 which stays at the precision the linear solve was asked for: order 1e-15 with
 the serial direct backend, order 1e-13 with the PETSc iterative backend at
-`relTol 1e-8` on the laminar cases, order 1e-9 on the RANS case. A value that
+the default `relTol 1e-12` on the laminar cases, order 1e-9 on the RANS case. A value that
 drifts upward across iterations means the block assembly, not the flow, is
 wrong. It is the cheapest smoke test in the log.
 
@@ -99,7 +100,7 @@ block system:
 | `PETSc` | `MATMPIAIJ` + KSP | MPI |
 
 **With the key omitted the solver picks `SparseLU` in serial and `PETSc` under
-MPI.** The three flow-through cases leave it out for exactly that reason: one
+MPI.** The four other cases leave it out for exactly that reason: one
 case directory then runs both ways unchanged. `cavity` sets it explicitly,
 because it is the case that documents the key — which is also why `cavity` is a
 serial tutorial. Naming a serial Eigen backend in a parallel run is a fatal
@@ -135,20 +136,20 @@ require checking every cell count and reference value below again.
 
 ## Reading the reference numbers
 
-The three flow-through cases report `areaAverage(inlet) of p`, a **kinematic**
+The four flow-through cases report `areaAverage(inlet) of p`, a **kinematic**
 pressure in m²/s² (that is, p/ρ). Their outlet is pinned at `p = 0` by a
 `fixedValue` patch, so the inlet average is directly the inlet-to-outlet
 pressure difference.
 
 `cavity` has no `fixedValue` pressure patch anywhere — every one of its patches
 is a wall — so the solver pins the level itself at `pRefCell` and prints
-`Pressure level: pinned at global cell 0 to p = 0`. The other three print
+`Pressure level: pinned at global cell 0 to p = 0`. The other four print
 `Pressure level: set by fixedValue patch outlet`, and their `pRefCell` and
 `pRefValue` entries are ignored.
 
 ## Verified reference values
 
-All four cases were run end to end with OpenFOAM 14 (build `14-7b05503f98a8`),
+All five cases were run end to end with OpenFOAM 14 (build `14-7b05503f98a8`),
 serially and — for the three that ship an `Allrun-parallel` — on 4 MPI ranks.
 Every value below is measured, not estimated.
 
@@ -158,6 +159,11 @@ Every value below is measured, not estimated.
 | `stripChannel` | 10 920 | 43 680 | 25 / 25 | 0.79284956 / 0.79284956 | 195 iterations, 0.79590565 |
 | `finnedDuct` | 12 048 | 48 192 | 16 / 16 | 0.5413873 / 0.5413873 | 72 iterations, 0.54431523 |
 | `stripChannelRAS` | 10 920 | 43 680 | 146 / 140 | 0.79310179 / 0.7931016 | 195 iterations, 0.79615726 |
+| `heatedDuct` | 8 000 | 32 000 | 11 / 11 | 13.0918221595 / 13.0918221595 | 177 iterations, 13.1185022898 |
+
+`heatedDuct` additionally reports a wall heat flux of 1.7944553015 K m³/s and a
+Nusselt number of 7.5416 at x = 8.975 m against the exact parallel-plate value
+of 7.5407.
 
 The two laminar flow-through cases reproduce their pressure drop **to every
 printed digit in serial and under MPI**, on different linear-algebra backends.

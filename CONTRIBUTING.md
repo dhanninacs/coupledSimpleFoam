@@ -27,7 +27,6 @@ Build switches are environment variables:
 | Variable | Effect |
 | --- | --- |
 | `COUPLED_NO_PETSC=1` | Serial Eigen-only build, even when PETSc is installed |
-| `PETSC_CUDA=1` | Link a CUDA-enabled PETSc named by `PETSC_DIR` / `PETSC_ARCH` |
 | `EIGEN_INC` | Override the Eigen include flag, e.g. `-I/opt/eigen/include` |
 
 `./Allclean` removes the object tree and all tutorial run output.
@@ -104,9 +103,10 @@ Two conventions are specific to this solver:
 
 ## Scope
 
-The solver is deliberately narrow: steady, incompressible, single phase, no
-energy equation, and turbulence handled segregated through OpenFOAM's own
-`momentumTransport` models. `fvModels`, `fvConstraints` and MRF are not
-assembled. `doc/USAGE.md` lists the limitations in full; changes that widen
+The solver is deliberately narrow: steady, incompressible, single phase, with
+turbulence handled segregated through OpenFOAM's own `momentumTransport`
+models and heat transfer, when it is switched on at all, handled the same way
+and only as a passive scalar - no buoyancy, constant properties. `fvModels`,
+`fvConstraints` and MRF are not assembled. `doc/USAGE.md` lists the limitations in full; changes that widen
 the scope are welcome but should start as an issue, since several of them
 interact with the fixed sparsity pattern above.

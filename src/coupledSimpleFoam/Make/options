@@ -2,8 +2,8 @@
 # coupledSimpleFoam - fully coupled steady incompressible p-U solver
 #
 # Distributed under the GNU General Public License version 3; see the LICENSE
-# file at the root of this repository.  Full build instructions, including the
-# optional CUDA build, are in doc/INSTALL.md.
+# file at the root of this repository.  Full build instructions are in
+# doc/INSTALL.md.
 #
 # Linear-algebra backends
 #   Eigen  (serial, always built)   header only.  The include flag comes from
@@ -15,56 +15,23 @@
 # Environment switches - nothing below is baked into the repository:
 #
 #   COUPLED_NO_PETSC=1  Build the serial Eigen-only solver even when PETSc is
-#                       installed.  Wins over PETSC_CUDA.
-#   PETSC_CUDA=1        Link against a CUDA-enabled PETSc instead of the system
-#                       one.  Its location comes from the standard PETSc
-#                       environment variables PETSC_DIR and PETSC_ARCH.  When a
-#                       second PETSc has to coexist with the installation that
-#                       PETSC_DIR already names, PETSC_CUDA_DIR and
-#                       PETSC_CUDA_ARCH override them for this build only.
+#                       installed.
 #   EIGEN_INC           Include flag for the Eigen headers, for example
 #                       EIGEN_INC=-I/opt/eigen/include.
 #
 # -DHAVE_PETSC is the only thing that enables the PETSc backend:
 # petscCoupledSolver.C compiles to an empty object file without it, and the
-# backend factory then reports a helpful runtime error.  The CPU and CUDA
-# builds produce the same executable name and so overwrite each other in
-# $FOAM_USER_APPBIN.
+# backend factory then reports a helpful runtime error.
+#
+# The solver sources are device agnostic.  An optional CUDA build layer for
+# NVIDIA GPUs lives in a companion repository and reuses these same sources
+# unchanged; see the README.
 #------------------------------------------------------------------------------
 
 EIGEN_INC ?= -I/usr/include/eigen3
 
-# CUDA PETSc location.  PETSC_DIR / PETSC_ARCH are the standard PETSc
-# environment variables and are the documented way to point at the build; the
-# $(HOME)/petsc-cuda fallback below is only a convention for a side-by-side
-# source build, never a requirement.
-PETSC_CUDA_DIR ?= $(PETSC_DIR)
-PETSC_CUDA_ARCH ?= $(PETSC_ARCH)
-
-ifeq ($(strip $(PETSC_CUDA_DIR)),)
-    PETSC_CUDA_DIR := $(HOME)/petsc-cuda
-endif
-ifeq ($(strip $(PETSC_CUDA_ARCH)),)
-    PETSC_CUDA_ARCH := arch-cuda-opt
-endif
-
-ifeq ($(PETSC_CUDA),1)
-    # Source build: ask its own pkg-config file first (it carries the full
-    # -l list for hypre/cusparse and any other configured package), fall back
-    # to bare -lpetsc.
-    PETSC_PCPATH := $(PETSC_CUDA_DIR)/$(PETSC_CUDA_ARCH)/lib/pkgconfig
-    PETSC_CFLAGS := $(shell PKG_CONFIG_PATH=$(PETSC_PCPATH) pkg-config --cflags petsc 2>/dev/null)
-    PETSC_LDFLAGS := $(shell PKG_CONFIG_PATH=$(PETSC_PCPATH) pkg-config --libs petsc 2>/dev/null)
-    ifeq ($(strip $(PETSC_CFLAGS)),)
-        PETSC_CFLAGS := -I$(PETSC_CUDA_DIR)/include -I$(PETSC_CUDA_DIR)/$(PETSC_CUDA_ARCH)/include
-        PETSC_LDFLAGS := -L$(PETSC_CUDA_DIR)/$(PETSC_CUDA_ARCH)/lib -lpetsc
-    endif
-    # A source build is not on the default loader path
-    PETSC_LDFLAGS += -Wl,-rpath,$(PETSC_CUDA_DIR)/$(PETSC_CUDA_ARCH)/lib
-else
-    PETSC_CFLAGS := $(shell pkg-config --cflags PETSc 2>/dev/null || pkg-config --cflags petsc 2>/dev/null)
-    PETSC_LDFLAGS := $(shell pkg-config --libs PETSc 2>/dev/null || pkg-config --libs petsc 2>/dev/null)
-endif
+PETSC_CFLAGS := $(shell pkg-config --cflags PETSc 2>/dev/null || pkg-config --cflags petsc 2>/dev/null)
+PETSC_LDFLAGS := $(shell pkg-config --libs PETSc 2>/dev/null || pkg-config --libs petsc 2>/dev/null)
 
 ifeq ($(COUPLED_NO_PETSC),1)
     PETSC_CFLAGS :=

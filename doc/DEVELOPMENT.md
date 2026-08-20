@@ -22,18 +22,18 @@ Contents:
 
 ## 1. Code map
 
-The solver is four translation units and two headers-as-include-files, all
+The solver is four translation units, three class headers and one header-as-include-file, all
 under `src/coupledSimpleFoam/`. It is deliberately small: there is one
 algorithm, and it is written out in one place rather than distributed across a
 class hierarchy.
 
 | File | Lines | Responsibility |
 | --- | --- | --- |
-| `coupledSimpleFoam.C` | ~1170 | The whole algorithm: controls, global indexing, assembly, solve, flux reconstruction, residuals, turbulence update |
-| `createFields.H` | ~105 | Constructs `p`, `U`, `phi`, the viscosity model, the momentum-transport model and `rAU` |
-| `coupledLinearSystem.H` / `.C` | ~215 / ~200 | `Foam::coupledLinearSystem` (COO triplet store) and `Foam::coupledSolver` (backend interface plus the selection factory) |
+| `coupledSimpleFoam.C` | ~1390 | The whole algorithm: controls, global indexing, assembly, solve, flux reconstruction, residuals, turbulence update, energy transport |
+| `createFields.H` | ~195 | Constructs `p`, `U`, `phi`, the viscosity model, the momentum-transport model, `rAU`, and - only when `solveEnergy` is on - `T` |
+| `coupledLinearSystem.H` / `.C` | ~250 / ~200 | `Foam::coupledLinearSystem` (COO triplet store) and `Foam::coupledSolver` (backend interface plus the selection factory) |
 | `eigenCoupledSolver.H` / `.C` | ~90 / ~210 | Serial Eigen backend: `SparseLU` (direct) and `BiCGSTAB` + `IncompleteLUT` |
-| `petscCoupledSolver.H` / `.C` | ~130 / ~350 | MPI backend: PETSc `MATMPIAIJ` + `KSP`, COO assembly, optional CUDA |
+| `petscCoupledSolver.H` / `.C` | ~160 / ~420 | MPI backend: PETSc `MATMPIAIJ` + `KSP`, COO assembly |
 | `Make/files`, `Make/options` | - | Build description and backend discovery |
 
 Reading order for a newcomer: the `Description` block at the top of
@@ -53,7 +53,10 @@ Everything before the outer loop is set up that never changes:
   sub-dictionary is absent (which is why every key has a default and the
   solver runs with no configuration at all). Note that the copy means
   dictionary lookups performed inside the loop, such as `pseudoUref`, still
-  see start-up values: no control is runtime-modifiable.
+  see start-up values: no control is runtime-modifiable. It is read
+  **before** `createFields.H`, because `solveEnergy` decides whether `T` is
+  constructed at all; that ordering is the one dependency `createFields.H` has
+  on the main file, and it is stated at the top of the header.
 - **Global indexing.** `globalIndex globalCells(mesh.nCells())`, from which
   `blockSize` (4), `rowStart`, `nLocalRows`, `nGlobalRows` and the per-cell
   global index array `gCell` are derived. `nbrGCell` is filled by
@@ -160,37 +163,71 @@ in `controlDict` does not terminate the run - `nOuterIterations` does.
    folded in here. On the converged iteration no solve happens, so the log
    prints `Final residual` equal to `Initial residual` with
    `No Iterations 0` - intended, not a stall.
-9. **Solve.** `lsolver->solve(sys, xNew)` with `xNew` pre-loaded with `xOld`:
+9. **Adaptive inner tolerance** (optional). When `adaptiveTolerance` is on,
+   the Eisenstat-Walker forcing term for this solve is computed from `res0`
+   and the previous iteration's value, guarded against over-loosening by the
+   previous forcing term, clamped into `[relTolMin, relTolMax]`, pushed to the
+   backend with `coupledSolver::setRelTol` and printed on its own log line.
+   The nonlinear residual it uses is `max(res0[0..3])` - the residual object
+   computed in step 8, not a second measure. Two scalars of loop state
+   (`ewResPrev`, `ewEtaPrev`) carry the recursion. The block sits *after* the
+   convergence test's `break`, so the converged iteration, which never solves,
+   computes and prints no forcing term. With the switch off this block does
+   not execute at all, which is what keeps the default path bit-identical.
+   See `doc/USAGE.md` 4.7.
+10. **Solve.** `lsolver->solve(sys, xNew)` with `xNew` pre-loaded with `xOld`:
    the previous solution is the initial guess, which matters because the outer
    loop is a Picard iteration (see section 6.2).
-10. **Unpack.** `U` and `p` are written back from `xNew`, then
+11. **Unpack.** `U` and `p` are written back from `xNew`, then
     `correctBoundaryConditions()` on both, then `buildRemote()` and a second
     `blockResiduals` for the reported final residual.
 
 **Solved fields to reconstructed flux.**
 
-11. **Flux reconstruction.** `phi` is rebuilt face by face from exactly the
+12. **Flux reconstruction.** `phi` is rebuilt face by face from exactly the
     same expression as the continuity row, with the same `Df`, the same
     `Seff` and the same *lagged* `gradPf`. Because the linear solve satisfied
     those rows, `div(phi)` is zero to machine precision. Coupled patches use
     remote `U` and `p` fetched by `syncTools::swapBoundaryCellList`;
     `zeroFluxPatch` patches are set to exactly zero.
-12. **Continuity reporting.** `div(phi)` is accumulated per cell and reduced
+13. **Continuity reporting.** `div(phi)` is accumulated per cell and reduced
     to produce the standard `time step continuity errors` line plus the
     diagnostic `coupled assembly check` line. That second line is a permanent
     verification print, not debug scaffolding; section 5.3 uses it as a gate.
-13. **Turbulence update.** `viscosity->correct()` and
+14. **Turbulence update.** `viscosity->correct()` and
     `momentumTransport->correct()` run *after* the flux reconstruction, so the
     transport equations see the flux the coupled system just produced and
     `nut` is current for the next assembly. Their initial residuals are then
     read back through `convergenceControl` for the next iteration's
     convergence test - which is why the turbulence criteria are lagged one
     iteration behind the p-U criteria.
-14. `runTime.write()`.
+15. **Energy transport** (optional, `solveEnergy`, default off). The same
+    pattern as step 14 and deliberately so: `alphaEff = nu/Pr + nut/Prt` is
+    rebuilt from the `nut` step 14 has just corrected, and
+    `fvScalarMatrix TEqn(fvm::div(phi, T) - fvm::laplacian(alphaEff, T))` is
+    relaxed with `TEqn.relax()` and solved with `TEqn.solve()`, so `T` picks
+    up its `solvers`, `relaxationFactors` and `residualControl` entries
+    through exactly the machinery `k` and `epsilon` use, and its residual is
+    lagged one iteration for the same reason theirs is. The flux is the `phi`
+    step 12 reconstructed, not an interpolation of `U`; that is what makes the
+    energy equation discretely conservative and what the `coupled energy
+    check` line at the end of the step verifies. Nothing here writes to `U`,
+    `p` or `phi`: for constant properties and no buoyancy `T` is a passive
+    scalar, so with the switch off *or on* the assembly of steps 1-7 is
+    bit-for-bit the same, which is what makes the regression gate of section
+    5.2 still meaningful after the feature. The step is skipped entirely, and
+    `T` is never constructed, when the switch is off.
+16. `runTime.write()`.
 
 The gradient is refreshed at step 5 of the *next* iteration, never between the
 matrix and the flux. Any change that breaks that pairing shows up immediately
 as a loss of machine-precision continuity (section 5.3).
+
+Steps 14 and 15 are the template for any further segregated equation: build it
+after the flux reconstruction, solve it with OpenFOAM's own machinery so that
+the case dictionaries mean what they mean everywhere else, and let the generic
+`residualControl` path pick the residual up. Anything that has to be *coupled*
+into the block system instead is a much larger change - section 6.3.
 
 
 ## 2. The backend abstraction
@@ -234,22 +271,42 @@ The remaining member functions:
 - `multiply(xLocal, xRemote, result)` and `multiplyUniform(xRef, result)` -
   used only by the residual machinery.
 - `rowData()` / `colData()` / `valData()` - raw contiguous arrays for batched
-  backends. This is the interface that makes the PETSc COO path (and hence the
-  GPU path) a direct handoff with no repacking.
+  backends. This is the interface that makes the PETSc COO path a direct
+  handoff with no repacking.
 
 ### 2.2 The solver interface
 
-`Foam::coupledSolver` is three functions:
+`Foam::coupledSolver` is four functions, only two of which a backend must
+implement:
 
 ```c++
 virtual const word& name() const = 0;               // for the log line
 virtual label solve(const coupledLinearSystem& sys, // returns linear iterations
                     scalarField& x) = 0;
+virtual void setRelTol(const scalar) {}             // optional, default no-op
 static autoPtr<coupledSolver> New(const dictionary& dict);
 ```
 
 `x` is sized `nLocalRows`, holds the initial guess on entry and the solution
 on return. A direct solve returns 1.
+
+`setRelTol` exists for the adaptive inner tolerance (`doc/USAGE.md` 4.7): the
+outer loop computes an Eisenstat-Walker forcing term and pushes it here before
+each solve. **Its default implementation is deliberately empty**, so a backend
+with no relative tolerance to set needs no change and cannot be broken by the
+feature - the Eigen backends inherit the no-op and the schedule is simply
+discarded. `petscCoupledSolver` overrides it to overwrite `relTolerance_`,
+which is the `rtol` argument of the `KSPSetTolerances` call already present in
+`solve`. The outer loop calls it only when `adaptiveTolerance` is on, so a
+default run never touches the value the dictionary set.
+
+The PETSc override does one thing more than store the number: it latches a
+flag, and that flag - not the tolerance value - is what makes the next `solve`
+select the initial-residual-relative KSP convergence test, because that, and
+not PETSc's default `||b||`-relative test, is the quantity an
+Eisenstat-Walker forcing term is defined against (section 3.7). Being called
+at all is therefore a mode change as well as a value change, which is why the
+hook has exactly one caller and is reached only from the adaptive path.
 
 `New` reads `linearSolver`, defaulting to `PETSc` when `Pstream::parRun()` and
 `SparseLU` otherwise. It raises a fatal error for `PETSc` in a build without
@@ -296,13 +353,6 @@ falls through to the Eigen constructor, which rejects unknown names.
   physics code. That is what allows a boundary condition to contribute to a
   diagonal that internal faces also touch, without either side knowing about
   the other.
-- **It is also the GPU-friendly path.** `MatSetPreallocationCOO` +
-  `MatSetValuesCOO` is PETSc's device assembly API: the pattern is registered
-  once, and each iteration hands over one contiguous value array. Switching
-  the linear algebra onto a device needs no change on the OpenFOAM side at
-  all - only `-mat_type aijcusparse -vec_type cuda` in `petscOptions`.
-  Profiling confirms the handoff is free: `MatSetValuesCOO` measures at 1 % of
-  wall time with zero logged host-device transfers.
 - **The value is API fit, not insertion speed.** Replacing per-entry
   `MatSetValues` calls with the batched COO path saved about 0.1 s per
   iteration (0.7 %) on a 483k-cell case. The insertion loop was never the
@@ -435,7 +485,7 @@ covered by the predicate and would leak.
   `fvPatch::coupled()` is true but whose face mapping is not one-to-one -
   `cyclicAMI` and other non-conformal couplings - takes the coupled branch and
   produces a wrong operator with no diagnostic. Adding a detection-and-fail
-  guard is a well-scoped contribution (section 6.6).
+  guard is a well-scoped contribution (section 6.5).
 - Reductions: `reduce(x, sumOp<scalar>())` for residual sums,
   `reduce(flag, maxOp<label>())` for the pressure-level flag. The latter is
   not optional - a patch that fixes `p` may exist on only some ranks.
@@ -553,21 +603,54 @@ case's `fvSchemes` are vestigial and harmless.
   so the assignment must be guarded by `MPI_Initialized()`; PETSc initialises
   MPI itself in that case.
 - **Some PETSc options are consumed inside `PetscInitialize`** and cannot come
-  from the dictionary string, which is inserted afterwards.
-  `-use_gpu_aware_mpi` is set by the constructor with `PetscOptionsSetValue`
-  before `PetscInitialize` (explicitly legal); `-log_view` must come from the
-  `PETSC_OPTIONS` environment variable.
+  from the dictionary string, which is inserted afterwards. Any such option has
+  to be set with `PetscOptionsSetValue` before `PetscInitialize`, which is
+  explicitly legal; `-log_view` must come from the `PETSC_OPTIONS` environment
+  variable.
 - **`VecGetArrayWrite` / `VecRestoreArrayWrite`, not `VecGetArray`**, for the
-  RHS and initial guess. Every local entry is overwritten, so the
-  device-to-host fetch `VecGetArray` performs is pure waste on a `VECCUDA` -
-  two full vector copies per outer iteration. Semantics are identical on a
-  host `Vec`.
-- **`MatSetFromOptions` must follow `MatSetType`** so that `-mat_type
-  aijcusparse` can replace the default. The same ordering applies to
+  RHS and initial guess. Every local entry is overwritten, so the write-only
+  accessors are the honest declaration: `VecGetArray` promises PETSc that the
+  contents on entry still matter, and they do not.
+- **`MatSetFromOptions` must follow `MatSetType`** so that a `-mat_type` in
+  `petscOptions` can replace the default. The same ordering applies to
   `VecSetFromOptions`.
 - **`MatSetBlockSize(A, 4)`** is what gives `PCFIELDSPLIT` the `[u,v,w]` and
   `[p]` index sets for free. Nothing about the split is coded; it is entirely
   option-driven.
+- **The block size is *not* forwarded to hypre.** `MatSetBlockSize` sets only
+  the default *value* of `-pc_hypre_boomeramg_numfunctions`, and the hypre
+  call that would apply it is guarded by that option's own "was it set" flag,
+  so leaving the option out means hypre runs at `num_functions = 1`. Every
+  systems-AMG and nodal-coarsening option then silently degenerates to its
+  scalar meaning, and the run still completes and still looks like a block
+  AMG - just a slow and ineffective one. Pass
+  `-pc_hypre_boomeramg_numfunctions 4` explicitly, and carry `-options_left`
+  whenever screening options, so that a misspelling is reported rather than
+  ignored. Every measurement in section 6.1 depends on both.
+- **`KSPConvergedDefaultSetUIRNorm` changes what `rtol` is relative to**, from
+  `||b||` to the initial residual `||b - A x_0||`. The outer loop warm-starts
+  every solve from the previous solution, so once a run is under way
+  `||b - A x_0||` sits orders of magnitude below `||b||`, and under the
+  default test a loose `rtol` is already satisfied before the first Krylov
+  step: `KSPSolve` returns having done no work, every line reports
+  `No Iterations 0`, and the outer residual stops moving altogether. An
+  Eisenstat-Walker forcing term is defined against the residual of the current
+  iterate, so the adaptive path selects this test and the fixed `relTol` path
+  deliberately does not - which is what keeps the default path's numbers what
+  they have always been. The call must come **after** `KSPSetFromOptions`,
+  which is what installs the default convergence test it modifies, and it is a
+  no-op if that test has been replaced through `petscOptions`.
+- **`KSPSetReusePreconditioner` is sticky.** It is `KSP` state, not a
+  per-solve argument, so a periodic-refresh policy has to set it back to
+  `PETSC_FALSE` on the iterations where the preconditioner is meant to be
+  rebuilt; setting it only on the reuse iterations freezes the preconditioner
+  for the remainder of the run, which is a different and measurably worse
+  policy (section 6.1). `pcReuseInterval` therefore toggles it explicitly in
+  both directions on every solve, after `KSPSetFromOptions` so that an
+  explicit `-ksp_reuse_preconditioner` in `petscOptions` cannot silently fight
+  the dictionary key. The older `reusePreconditioner`, which freezes after the
+  first build, is applied once at setup and takes precedence; the periodic
+  branch stays out of its way and the constructor warns when both are set.
 - **PETSc 3.19 to 3.25 API skew: none.** `MatSetPreallocationCOO`,
   `MatSetValuesCOO`, `KSPSetTolerances`, `PETSC_DEFAULT` and the
   `VecGetArrayWrite` family are unchanged.
@@ -594,7 +677,7 @@ modified.
 
 ### 4.2 How `Make/options` selects backends
 
-`Make/options` is a GNU makefile fragment, so it can compute. It does four
+`Make/options` is a GNU makefile fragment, so it can compute. It does three
 things:
 
 1. **Eigen include.** `EIGEN_INC ?= -I/usr/include/eigen3`. Eigen is header
@@ -604,16 +687,7 @@ things:
    fallback to lowercase `petsc` (Debian ships the capitalised `.pc` name).
    Nothing is hardcoded and nothing needs editing to enable PETSc: install it
    and rebuild.
-3. **CUDA PETSc.** With `PETSC_CUDA=1`, the query instead runs against
-   `$(PETSC_CUDA_DIR)/$(PETSC_CUDA_ARCH)/lib/pkgconfig` - defaulting to the
-   standard `PETSC_DIR` / `PETSC_ARCH` variables - because that `.pc` file
-   carries the full library list for hypre, cuSPARSE and anything else
-   configured in. If pkg-config finds nothing it falls back to bare `-lpetsc`
-   with explicit include and library paths. Either way it appends
-   `-Wl,-rpath` to that library directory, since a source build is not on the
-   loader path.
-4. **Disable.** `COUPLED_NO_PETSC=1` blanks both flag sets and wins over
-   `PETSC_CUDA`.
+3. **Disable.** `COUPLED_NO_PETSC=1` blanks both flag sets.
 
 MPI flags come from `mpicc --showme:compile` and `--showme:link`, because
 PETSc's `.pc` file does not carry the MPI include path. `--showme` is
@@ -634,22 +708,15 @@ partially-built state.
 
 | Switch | Effect |
 | --- | --- |
-| *(none)* | PETSc auto-detected through pkg-config; CPU only |
+| *(none)* | PETSc auto-detected through pkg-config |
 | `COUPLED_NO_PETSC=1` | Eigen-only build; wins over everything else |
-| `PETSC_CUDA=1` | Link a CUDA-enabled PETSc |
-| `PETSC_DIR` / `PETSC_ARCH` | Standard PETSc variables naming that build |
-| `PETSC_CUDA_DIR` / `PETSC_CUDA_ARCH` | Override the above for this build only, when two PETSc installations must coexist |
 | `EIGEN_INC` | Eigen include flag |
 | `PETSC_OPTIONS` | Runtime, not build time. The only route for `-log_view` |
 
-All three build configurations produce the **same executable name** and
-overwrite each other in `$FOAM_USER_APPBIN`. Always `./Allclean` when
-switching, because the include paths differ, and confirm which one is
-installed with `ldd $FOAM_USER_APPBIN/coupledSimpleFoam | grep -iE "petsc|cuda"`.
-
-Note the asymmetry that follows: CPU versus GPU **linear algebra** is a
-runtime choice (`-mat_type aijcusparse -vec_type cuda` in `petscOptions`), but
-CPU versus CUDA **PETSc** is a compile-time choice.
+Both build configurations produce the **same executable name** and overwrite
+each other in `$FOAM_USER_APPBIN`. Always `./Allclean` when switching, because
+the include paths differ, and confirm which one is installed with
+`ldd $FOAM_USER_APPBIN/coupledSimpleFoam | grep -i petsc`.
 
 ### 4.4 Library set
 
@@ -715,8 +782,8 @@ and the `Ux` profile along the vertical centreline of a structured 2-D mesh.
 ./Allclean && COUPLED_NO_PETSC=1 ./Allwmake     # Eigen only
 ```
 
-Add `PETSC_CUDA=1` if a CUDA PETSc is available. A change that only compiles
-with PETSc present has broken the `#ifdef HAVE_PETSC` isolation.
+A change that only compiles with PETSc present has broken the
+`#ifdef HAVE_PETSC` isolation.
 
 ### 5.2 Gate 1: laminar bit-level regression
 
@@ -869,6 +936,14 @@ the gap falls from 0.678 % to 0.075 % at matched damping - larger than in
 laminar cases because `nuEff` spans orders of magnitude and `rAU` therefore
 jumps harder.
 
+A fourth confirmation comes from refinement rather than from matching. On the
+same interrupted-fin geometry meshed at 269k, 533k, 1.07M and 2.15M cells, the
+unmatched pressure-drop difference falls 0.18 % -> 0.12 % -> 0.063 % ->
+0.014 % (`doc/BENCHMARKS.md` 9.4). That is what a difference of O(h^2) should
+do under refinement, and what an inconsistency in the operator would not, so a
+gate-4 discrepancy that does *not* shrink with the mesh is the one to
+investigate.
+
 ### 5.6 Gate 5: RANS smoke
 
 Required when a change touches the momentum operator or the turbulence path.
@@ -907,6 +982,12 @@ If the claim is performance, the protocol is:
   3.5x while leaving iteration counts and pressures untouched.
 - **State mesh, cell count, backend, rank count, outer iterations and seconds
   per outer iteration.** `doc/BENCHMARKS.md` sets the format.
+- **Name the configuration.** The shipped defaults and the tuned
+  large-three-dimensional configuration of `doc/BENCHMARKS.md` 9.2 differ by
+  a factor of 5.5 on the 2.15M-cell case, so a wall-clock figure that does not
+  say which `COUPLED` dictionary produced it cannot be compared with anything.
+  State at minimum the `petscOptions` string and whether `adaptiveTolerance`
+  and `pcReuseInterval` were in use.
 
 For calibration, changing the momentum operator to `divDevSigma` measured as a
 ratio of 1.055 on the cavity and 1.008 on stripChannel - a 1-5 % cost from the
@@ -917,47 +998,128 @@ back-to-back protocol gives.
 ## 6. Extension roadmap
 
 Concrete directions, with what the existing measurements actually say about
-each. All performance figures below are for the reference cases in
+each - including, in 6.1, a direction the measurements have since closed off.
+All performance figures below are for the reference cases in
 `doc/BENCHMARKS.md`.
 
 ### 6.1 A custom block-AMG preconditioner with block smoothers
 
-**Difficulty: high.** This is a research-scale project - a coupled algebraic
-multigrid over the block-4 system with block-ILU or Vanka-type smoothers, in
-the tradition of block-selective AMG for implicitly coupled pressure-velocity
-systems and of solvers such as ICSFoam that build the hierarchy themselves.
-PETSc's generic components do not provide it.
+**Difficulty: high, and the generic routes are now closed by measurement.** A
+coupled algebraic multigrid over the block-4 system with block-ILU or
+Vanka-type smoothers - in the tradition of block-selective AMG for implicitly
+coupled pressure-velocity systems, and of solvers such as ICSFoam that build
+the hierarchy themselves - is still a genuine open project. What has changed
+is that it is no longer an unexplored one. Every route that reaches it through
+generic PETSc and hypre components has been assembled, run and costed on the
+largest case in the repository, and all of them lose to the Schur splitting
+that ships. The project is therefore not "try block AMG"; it is "write the
+coarsening, interpolation and smoothers that the generic components do not
+have", against a bar the measurements below fix.
+
+**What was tried and what it cost.** Seconds per outer iteration on the
+2.15M-cell interrupted-fin duct (8.6M unknowns, ten MPI ranks), with the block
+residual after three outer iterations as the quality measure:
+
+| Preconditioner | s per outer iteration | Residual after 3 outer iterations |
+| --- | --- | --- |
+| Schur `a11` + BoomerAMG (adopted) | 98.7 | 0.037 |
+| hypre nodal, block interpolation + nodal Schwarz smoother | 363-370 | 0.058-0.061 |
+| hypre nodal systems-AMG (Frobenius) | 389 | 0.977 |
+| hypre nodal systems-AMG (row sum) | 684 | 0.968 |
+| GAMG, unsmoothed aggregation + block Jacobi | fails | diverges with NaN on the first application, `KSP` reason -9 |
+| best of the above plus diagonal equation scaling | 292 | 0.114 |
+
+Every one of those runs passed `-pc_hypre_boomeramg_numfunctions 4`, without
+which hypre stays at `num_functions = 1` and every systems-AMG option silently
+degenerates into its scalar meaning (section 3.7), and every one carried
+`-options_left`, which reported no unused options. The table therefore
+compares configurations that were actually in effect rather than option
+strings that were quietly ignored, which is the failure mode this particular
+experiment is most exposed to.
 
 What the evidence says:
 
-- **It is where the remaining time is.** Profiling puts roughly 70 % of
-  per-iteration wall time in the preconditioner - about 44 % in one AMG solve
-  on the Schur block and 25 % in velocity-block ILU setup. Assembly is 1 %.
-- **Generic scalar AMG on the whole block system does not work.** GAMG applied
-  monolithically had to be killed after 20 minutes for a single iteration.
-  Scalar smoothed aggregation with point smoothers cannot handle the
-  stabilised saddle-point structure.
-- **The one AMG that does work on the hard topology is nodal systems-AMG**,
-  which reproduces the reference answer on the interrupted-fin channel but at
-  per-inner cost comparable to ASM, and it has no device implementation.
-- **The design constraint is cheap setup, not reuse.** Freezing the
-  preconditioner across outer iterations costs +53 % wall time, and freezing
-  only the hierarchy structure costs +66 %. The Picard operator changes fast
-  enough that a stale preconditioner buys more inner iterations than it saves
-  in setup. A block-AMG must therefore make *fresh* setup intrinsically cheap
-  - pairwise or double-pairwise aggregation is the architecture reference -
-  rather than amortise setup across iterations.
-- **The bar has moved.** The shipped fieldsplit-Schur with hypre BoomerAMG on
-  the Schur block already delivered 2.7x over the previous default from a
-  one-line options change. A custom block-AMG competes against that, not
-  against the old baseline.
+- **The architecture is directionally sound.** Block interpolation with a
+  block smoother improves the three-iteration residual sixteenfold over plain
+  nodal coarsening on the same matrix. The idea is not what fails.
+- **Generic components make it three to four times too expensive.** The best
+  block-AMG configuration costs 363 s per outer iteration against 98.7 s for
+  the Schur splitting on the same matrix, and the two nodal systems-AMG
+  variants are slower still while leaving the residual essentially where it
+  started. A per-iteration cost three to four times higher cannot be recovered
+  by an outer-iteration count the coupled loop already holds below 30.
+- **Equation scaling is not the missing piece.** Diagonal equation scaling
+  does help the block-AMG configurations, 363 s to 292 s per outer iteration,
+  but it *hurts* the adopted one, taking Schur `a11` from 98.7 s to 196.7 s.
+  It narrows the gap partly by making the winner worse, which is not a result
+  to build on.
+- **Generic scalar AMG on the whole block system still does not work.** GAMG
+  applied monolithically had to be killed after 20 minutes for a single
+  iteration in the earlier screening, and the unsmoothed-aggregation and
+  block-Jacobi variant tried at 8.6M unknowns diverges with NaN on its first
+  application. Scalar smoothed aggregation with point smoothers cannot handle
+  the stabilised saddle-point structure.
+- **Nodal systems-AMG is robust but not competitive.** It is the one AMG that
+  reproduces the reference answer on the hard interrupted-fin channel
+  topology, at per-inner cost comparable to ASM there. At 8.6M unknowns that
+  robustness costs 389 s per outer
+  iteration against 98.7 s for the Schur splitting, and it makes no residual
+  progress in three iterations.
+- **Where the time still is.** Profiling puts roughly 70 % of per-iteration
+  wall time in the preconditioner - about 44 % in one AMG solve on the Schur
+  block and 25 % in velocity-block ILU setup - against 1 % in assembly. That
+  is the budget a block AMG would be competing for, and it is also the budget
+  that the three-dimensional AMG tuning and `pcReuseInterval` have already
+  taken a large bite out of.
+- **The design constraint is cheap setup *or* tolerance of reuse.** Freezing
+  the preconditioner for the whole run costs +53 % wall time on the 483k-cell
+  case, and freezing only the hierarchy structure costs +66 %, so a
+  preconditioner that is simply never refreshed loses. But rebuilding one
+  every 8 to 12 outer iterations is worth the step from 354 s to 203 s on the
+  2.15M-cell case, once the V-cycle itself has been made cheap. Both routes
+  are open to a custom implementation - pairwise or double-pairwise
+  aggregation for intrinsically cheap fresh setup, or a hierarchy good enough
+  to survive ten Picard updates - and it has to take one of them.
+- **The bar has moved twice.** The shipped fieldsplit-Schur with hypre
+  BoomerAMG on the Schur block delivered 2.7x over the previous default from a
+  one-line options change; the tuned large-three-dimensional configuration
+  then took the 2.15M-cell case from 1112 s to 203 s - 29 outer iterations at
+  about 7 s each, against 478 s and 555 iterations for segregated SIMPLE
+  (`doc/BENCHMARKS.md` 11). The screening table above predates that tuning, so
+  the 98.7 s per outer iteration it credits to the adopted route overstates
+  the target. What a custom block AMG has to beat on that case today is about
+  7 s per outer iteration, its own setup included and amortised over whatever
+  reuse interval it can sustain.
 
 ### 6.2 Adaptive inner tolerances
 
-**Difficulty: low to moderate**, and the highest ratio of value to effort on
-this list. `KSPSetTolerances` is already called on every solve, so the change
-is a policy plus a control loop, contained in `petscCoupledSolver::solve` and
-its dictionary keys.
+**Implemented** - `adaptiveTolerance` and the `relTolMax` / `relTolMin` /
+`adaptiveGamma` / `adaptiveAlpha` keys, off by default; see `doc/USAGE.md`
+4.7 for the schedule and 2.2 for the keys. The control loop lives in
+`coupledSimpleFoam.C` between the residual evaluation and the solve (step 9 of
+section 1.2), and reaches the backend through the optional
+`coupledSolver::setRelTol` hook, whose default implementation is empty so that
+a backend with no relative tolerance to set simply discards the schedule
+(section 2.2). The one PETSc subtlety the feature depends on is that the
+adaptive path must also switch the KSP convergence test to the
+initial-residual norm, which is what the hook latches on the backend side and
+what section 3.7 explains.
+
+Periodic preconditioner refresh (`pcReuseInterval`) landed alongside it, in
+`petscCoupledSolver::solve` rather than in the outer loop, because it is a
+property of one backend's `KSP` object and not of the algorithm. The solve
+counter decides whether this is a rebuild iteration, and
+`KSPSetReusePreconditioner` is set in *both* directions from it - explicitly
+cleared on rebuild iterations, so that a periodic refresh cannot decay into
+the freeze-for-the-whole-run policy that `reusePreconditioner` implements and
+that section 6.1 measures as counterproductive. Where both keys are set the
+older one wins and the constructor says so.
+
+The evidence below is what motivated the design and still governs how the
+keys should be set; it is unchanged by the implementation. Note in particular
+that the schedule is *not* a substitute for damping - the damping bullet below
+is the reason `pseudoTransient` remains the first thing to reach for on a
+large 3-D case.
 
 What the evidence says:
 
@@ -978,7 +1140,18 @@ What the evidence says:
   6e-6 / 1e-4 after 80 outer iterations. Damping is what converts loose inner
   solves into convergence, so an adaptive scheme cannot ignore it.
 - Eisenstat-Walker forcing terms are the standard formulation for exactly this
-  problem and are unexplored here.
+  problem, which is why the schedule that shipped is one.
+
+What it bought, measured on the 2.15M-cell case: `adaptiveTolerance yes` with
+`relTolMax 1e-2` took the run from 1112 s to 710 s and, more importantly,
+fixed a convergence test that the fixed `relTol 1e-6` baseline never satisfied
+at all. It is the first of the compounding changes that end at 203 s.
+`pcReuseInterval` contributes twice in the same sequence - 3 is worth 665 s
+early on, and 8 is worth the final step from 354 s to 203 s once the
+three-dimensional AMG tuning has made each V-cycle cheap enough for a long
+reuse interval to pay, with 8 to 12 the measured optimum (206 s at 12, 238 s
+at 16). `doc/BENCHMARKS.md` 9.1 has the full progression, and 9.2 the
+resulting configuration.
 
 ### 6.3 Coupling turbulence into the block system
 
@@ -996,12 +1169,17 @@ What the evidence says:
   (section 5.6): 4e-05 to 3e-08 in 40 iterations, at about 0.82 per iteration.
 - **The same floor appears in the segregated solver**, so it is a property of
   lagged RANS rather than of this solver.
-- **But the payoff is not obvious.** Per-iteration cost already dominates: on
-  a 12k-cell 2-D RANS case the coupled solver needs 779 outer iterations
-  against 1,997 for SIMPLE and still loses on wall clock, 389 s against 61 s.
-  A 6x6 block system raises per-iteration cost further, and the preconditioner
-  question (section 6.1) would have to be answered for the larger block before
-  the iteration saving could be realised.
+- **But the payoff is not obvious.** Per-iteration cost dominates in exactly
+  the regime this would target: on a 12k-cell 2-D RANS case the coupled solver
+  needs 779 outer iterations against 1,997 for SIMPLE and still loses on wall
+  clock, 389 s against 61 s. The large laminar 3-D result that puts the
+  coupled solver ahead of segregated (`doc/BENCHMARKS.md` 11) does not carry
+  over on its own, because it comes from the p-U block's mesh-independent
+  outer-iteration count, and in RANS both solvers floor out on the lagged
+  turbulence before that can be spent. A 6x6 block system raises per-iteration
+  cost further, and the preconditioner question of section 6.1 - where every
+  generic block AMG measured costs three to four times the Schur splitting on
+  the 4x4 system - would have to be answered again for the larger block.
 - The honest scope is: documented as future work, with a clear mechanism and
   an unproven payoff.
 
@@ -1020,52 +1198,7 @@ enters the coupling, and both the block structure and the `selfp` Schur
 approximation would need rethinking. The existing preconditioner evidence does
 not transfer.
 
-### 6.5 GPU work
-
-**Difficulty: the path already works.** On a CUDA-enabled PETSc build, adding
-`-mat_type aijcusparse -vec_type cuda` to `petscOptions` moves the entire
-linear-algebra path onto the device with no rebuild of the solver logic,
-because the COO assembly is already PETSc's device assembly API.
-
-What the evidence says - and this is scoped to one workstation-class card with
-1/64-rate FP64, under WSL2, with no MPS and a non-CUDA-aware MPI, so it should
-not be extrapolated:
-
-- **It is numerically exact.** At `relTol 1e-12` the device path reproduces
-  the serial direct-solve reference to all printed digits.
-- **It is not faster.** At fixed preconditioner and rank count the GPU is 7 %
-  slower (8.25 against 7.72 s per outer iteration); over full runs it ties
-  (94.3 s at np4 on the device against 94.7 s at np6 on the host); on a
-  43,680-unknown problem it is about 30x slower, far below the kernel-launch
-  break-even. It wins only where the host preconditioner is weak, which is a
-  win over a worse algorithm.
-- **Scaling is inverted with rank count** - 3.55, 4.28 then 5.90 s per outer
-  iteration at 4, 6 and 8 ranks - because without MPS each rank opens its own
-  CUDA context on one device and they time-slice. The host control over the
-  same range is flat to improving.
-- **The structural reason is data movement in the preconditioner.** About
-  1.53 GB is copied device-to-host per run, because `PCFIELDSPLIT` extracts
-  submatrices and hypre needs its own format, both round-tripping every outer
-  iteration. Since the matrix is rebuilt and re-shipped every Picard step,
-  there is nothing to amortise. Utilisation is 97-99 %, so this is not an
-  occupancy problem.
-- **Both routes to a device-resident *block* AMG are closed on that
-  platform.** A GPU-native aggregation AMG segfaults inside the virtualised
-  CUDA driver during matrix upload, and its aggregation selectors resolve to
-  host-only implementations; hypre's nodal systems-AMG - the only AMG that
-  reproduces the reference on the hard 2-D topology - has no device
-  implementation. What remains on the device is scalar AMG on the Schur
-  complement, which is what ships.
-- **What would change the answer**: bare-metal Linux with a working
-  block-AMG library; MPS, or one rank per device; a part with 1/2-rate rather
-  than 1/64-rate FP64; and a mesh large enough that the per-Picard matrix
-  re-ship stops dominating. None of those applied to the measurements above.
-
-The honest summary: the 2.7x that was actually achieved came from the
-algorithm - swapping GAMG for hypre BoomerAMG on the Schur block - and was
-entirely on the CPU.
-
-### 6.6 Smaller, well-scoped items
+### 6.5 Smaller, well-scoped items
 
 Good first contributions. Each is a documented rough edge with a known fix.
 

@@ -5,10 +5,10 @@ been checked, by what method, what was measured, and - at least as important -
 what has not been checked. Performance numbers live in `doc/BENCHMARKS.md`;
 this file is only about whether the answers are right.
 
-Sections 1 to 6 are the verification layers, section 7 is the defect history,
-section 8 relates the observed behaviour to the published literature, section 9
-is the explicit list of what is *not* covered, and section 10 explains how to
-reproduce the whole set.
+Sections 1 to 7 are the verification layers, section 8 is the defect history,
+section 9 relates the observed behaviour to the published literature, section
+10 is the explicit list of what is *not* covered, and section 11 explains how
+to reproduce the whole set.
 
 ## Contents
 
@@ -18,10 +18,11 @@ reproduce the whole set.
 4. [Parallel consistency](#4-parallel-consistency)
 5. [Cross-implementation check](#5-cross-implementation-check)
 6. [Turbulence regression](#6-turbulence-regression)
-7. [Defects found and fixed during verification](#7-defects-found-and-fixed-during-verification)
-8. [Comparison with the published literature](#8-comparison-with-the-published-literature)
-9. [What is not validated](#9-what-is-not-validated)
-10. [Re-running the verification](#10-re-running-the-verification)
+7. [Energy transport](#7-energy-transport)
+8. [Defects found and fixed during verification](#8-defects-found-and-fixed-during-verification)
+9. [Comparison with the published literature](#9-comparison-with-the-published-literature)
+10. [What is not validated](#10-what-is-not-validated)
+11. [Re-running the verification](#11-re-running-the-verification)
 
 ---
 
@@ -73,7 +74,7 @@ the flux reconstruction and the assembled continuity row agree with each other,
 but not that either is correct; layer 4 verifies the answer but is limited by
 how well the reference itself is converged; layer 5 verifies the parallel code
 against the serial code but not the physics. The one defect that survived
-several of these layers is described in section 7.1, and it survived exactly
+several of these layers is described in section 8.1, and it survived exactly
 because it was consistent with itself.
 
 Every check below is either a case under `tutorials/` or a script under
@@ -172,7 +173,7 @@ solve converged. It does **not** verify:
   a flux it physically should not, and the same wrong flux appears in both the
   matrix row and the reconstruction, the divergence is still exactly zero. This
   is not hypothetical: it is precisely how the constraint-patch mass leak of
-  section 7.1 stayed invisible to this check while corrupting an integral
+  section 8.1 stayed invisible to this check while corrupting an integral
   quantity by 9.6 per cent.
 
 ---
@@ -313,6 +314,46 @@ reason.
 The default remains `rhieChowFactor 1.0`, because it is the correct choice for a
 solver with no relaxation factor. The key exists to reproduce a segregated
 reference for verification, not for production use.
+
+### Agreement under mesh refinement
+
+If the residual difference between the two solvers is the order-`h^2` damping
+term identified above rather than an implementation error, it has to shrink
+under refinement instead of holding at a fixed level. That is a testable
+prediction, and it has been tested on a single structured three-dimensional
+interrupted-fin duct meshed at four resolutions, with both solvers run at their
+best settings on ten ranks, identical schemes, and identical `residualControl`
+(`U` 1e-5, `p` 1e-4). Every run formally converged.
+
+| cells | `dp` difference | all-cell rms abs(dU), per cent of field maximum |
+| --- | --- | --- |
+| 269,000 | 0.18 % | 0.12 % |
+| 533,000 | 0.12 % | 0.090 % |
+| 1,070,000 | 0.063 % | 0.074 % |
+| 2,150,400 | 0.014 % | 0.075 % |
+
+The pressure-drop difference falls by more than a factor of ten across a factor
+of eight in cell count. An assembly error does not behave that way; a term that
+vanishes with the mesh does, and the rate is the one the `h^2` attribution
+predicts. The field rms falls more slowly and settles near 0.075 per cent, which
+supports the same attribution rather than contradicting it: the rms is dominated
+by the fin corners, where `rAU` jumps hardest between neighbours, in the same
+way that the cavity's all-cell difference is dominated by the singular lid
+corner while its centreline difference is two orders of magnitude smaller.
+
+The finest point additionally separates accuracy from solver effort. On the
+2,150,400-cell mesh the coupled `dp` is 0.96255897 against the segregated
+0.96269619, and over all 2,150,400 cells the rms velocity difference is 1.26e-3,
+0.075 per cent of the field maximum. The same case solved slowly, with tight
+inner tolerances throughout, differs from segregated by 1.28e-3 - the same
+number. The gap to segregated is therefore a property of the discretisation and
+not of how hard the linear systems were solved, so the tuned configuration of
+`doc/BENCHMARKS.md` section 9.2, which reaches the answer in a fraction of the
+wall clock, does not pay for that speed in accuracy. Normalised
+`abs(div(phi))` on that run is about 1e-9 rather than the 1e-16 of the small
+tightly solved cases; that is the loose inner tolerance showing up in the
+readout of section 2, not an assembly inconsistency, and the field and integral
+agreement improve at that mesh level rather than degrading.
 
 ---
 
@@ -537,14 +578,332 @@ precision under a strongly varying `nuEff`.
 
 ---
 
-## 7. Defects found and fixed during verification
+## 7. Energy transport
+
+`COUPLED/solveEnergy` adds a temperature equation
+
+```
+fvm::div(phi, T) - fvm::laplacian(alphaEff, T) = 0,    alphaEff = nu/Pr + nut/Prt
+```
+
+solved segregated after the coupled p-U solve, on the conservative Rhie-Chow
+flux that solve produced. This section is the evidence for it. Everything below
+is on `tutorials/heatedDuct` unless stated otherwise: a plane channel 10 m long
+and 1 m high, 200 x 40 cells, Re = U*Dh/nu = 20, Pr = 7, Pe = 140, inlet at
+300 K and both walls at 350 K.
+
+Three checks, in increasing order of what they can catch:
+
+1. **Against a segregated reference solving the identical discrete equation**,
+   which catches an error in the equation or in the flux it is given.
+2. **Against an exact analytical result**, Nu = 7.5407, which catches an error
+   the reference shares - because the reference is OpenFOAM's own
+   `scalarTransport`, not an independent discretisation.
+3. **Discrete energy conservation**, which is the temperature counterpart of
+   section 2 and catches a boundary term that is in the matrix but not in the
+   balance, or the reverse.
+
+### 7.1 Two segregated references, and why both
+
+OpenFOAM 14's `scalarTransport` function object solves
+
+```c++
+fvm::ddt(s) + fvm::div(phi, s, "div(phi,s)")
+  - fvm::laplacian(D, s, "laplacian(Ds,s)") == fvModels.source(s)
+```
+
+with `D = alphal*nu + alphat*nut` when `diffusivity viscosity` is selected.
+With `ddtSchemes { default steadyState; }`, `alphal = 1/Pr` and
+`alphat = 1/Prt`, that is the solver's `TEqn` **term for term**: same operators,
+same scheme lookups (`div(phi,T)` in both; the laplacian resolves through the
+`laplacianSchemes` `default` in both, the solver naming its diffusivity
+`alphaEff` and the function object naming its own `DT`), and the same
+`relax(0)`-is-a-no-op relaxation path. It is therefore the right reference, and
+it is used two ways.
+
+**Reference A - frozen flux.** The converged `U`, `p` and `phi` of the coupled
+run are copied into a fresh case and `foamRun -solver functions` with
+`subSolver incompressibleFluid` executes only the function object. The flux is
+then *bit-identical* to the one the coupled solver used, so the two are solving
+the same linear system and any difference is linear-solver tolerance and
+nothing else. This is the check that isolates the energy equation from the
+flow.
+
+**Reference B - full segregated run.** `foamRun -solver incompressibleFluid`
+solves the flow with SIMPLE from the same `0/` fields and schemes, with the
+function object solving `T` alongside it. Here the flux differs by the
+Rhie-Chow damping definition of section 3, so the temperature difference is a
+discretisation difference, not an error, and it has to be read with the same
+caution section 3 sets out - including that the reference's own convergence
+level dominates at production criteria.
+
+Measured, over all 8 000 cells, on a field whose range is 49.28 K:
+
+| Comparison | max abs(dT) | rms abs(dT) | wall heat flux difference |
+| --- | --- | --- | --- |
+| coupled vs reference A (frozen flux) | 4.05e-05 K | 2.78e-06 K | 1.87e-08, 1.04e-08 relative |
+| coupled vs reference B, `p 1e-4 / U 1e-5` | 4.52e-02 K | 3.40e-03 K | 2.20e-04, 1.22e-04 relative |
+| coupled vs reference B, `p 1e-9 / U 1e-9` | 4.52e-02 K | 3.04e-03 K | 1.30e-04, 7.26e-05 relative |
+| reference B production vs reference B tight | 3.68e-03 K | 9.43e-04 K | 8.95e-05, 4.99e-05 relative |
+
+Reference A is the load-bearing row. The two agree to **8.2e-07 of the field
+range**, and the residual difference is not a discretisation difference at all
+but the coupled run's own convergence level: its temperature equation is solved
+once per outer iteration and the loop stops at `residualControl T 1e-6`, while
+the reference was iterated to a `T` residual of 9.5e-13 and `No Iterations 0`.
+Tightening the coupled criterion moves this figure and nothing else. The wall
+heat fluxes agree to 1.0e-08 relative and the Nusselt numbers to 1e-09, which
+is the statement that matters: **given the same flux, the two implementations
+produce the same discrete temperature field.**
+
+One practical point that row also establishes. With a second-order upwind
+`div(phi,T)` the convection term carries a deferred correction, so the
+temperature equation is not linear in one pass even at frozen flux: the
+reference needed roughly thirty passes to take its residual from 3.7e-03 to
+9.5e-13. Five passes - the obvious choice - leaves it at 6.8e-05 and the
+comparison then reads 1.1e-02 K, which is the reference's convergence and not
+the solver's error. A frozen-flux check has to converge the correction loop
+before it means anything.
+
+Reference B is a discretisation comparison and behaves like section 3's. The
+coupled-versus-segregated difference, 4.5e-02 K, is an order of magnitude
+larger than the reference's own convergence error, 3.7e-03 K, so it is a real
+difference between the two discretisations rather than an artefact of stopping
+the reference early - and it is the Rhie-Chow damping difference of section 3
+arriving in the temperature field through `phi`, not anything belonging to the
+energy equation. The inlet pressure drops carry the same signature: 13.0918
+coupled against 13.1136 for the tightly converged segregated run, 0.17 %, which
+is the middle of the 0.17-0.38 % band section 3 reports for the laminar 2-D
+suite. The wall heat flux differs by 0.007 %.
+
+### 7.2 The physics gate: Nu = 7.5407
+
+Fully developed laminar flow between parallel plates held at a constant and
+equal temperature has a Nusselt number of 7.5407 (Shah & London; see
+`doc/REFERENCES.md`). The value is exact, it is independent of Pr and Re, and
+it depends on the temperature field alone - both the conductivity and `rho*cp`
+cancel out of
+
+```
+Nu = |dT/dy|_wall * Dh / (Tw - Tb),      Dh = 2*H
+```
+
+so reproducing it tests the discrete temperature solution and nothing else.
+`tools/heated_duct_nusselt.py` computes it from the written `T` and `U` and the
+cell centres of `foamPostProcess -func writeCellCentres`; the bulk temperature
+is the flux-weighted mean over the cross-section and the wall gradient is
+one-sided from the near-wall cell.
+
+**The post-processor was calibrated first, so that its error is not charged to
+the solver.** The fully developed profile is the first Graetz eigenmode: the
+solution of `phi'' + beta*u(y)*phi = 0` with `phi(0) = phi(H) = 0` and
+`u = 6*y*(H-y)/H^2`. Integrating that by shooting to a tolerance of 1e-12 gives
+`beta = 7.5407008741` and, from the eigenfunction itself,
+`Nu = |phi'(0)|*Dh/|phi_bulk| = 7.540690` - the published value to five
+figures, which confirms the analytical target independently of any code.
+Sampling that exact `phi` at the 200 x 40 cell centres of this tutorial and
+handing it to `heated_duct_nusselt.py` returns **7.5430, i.e. +0.030 %**. That
+is the post-processor's own error at this mesh - the one-sided wall gradient
+and the midpoint bulk integral, no solver involved - and it is therefore the
+value the solver should be measured against: a computed Nusselt number near
+7.543 means the discrete temperature field is right, and the residual 0.03 %
+is the post-processing, not the physics.
+
+On the tutorial, with the wall at 350 K and the inlet at 300 K:
+
+| x, m | Tb, K | Tw - Tb, K | abs(dT/dy) at the wall | Nu | Nu/7.5407 |
+| --- | --- | --- | --- | --- | --- |
+| 1.975 | 313.811 | 36.189 | 143.928 | 7.9542 | 1.0548 |
+| 2.975 | 317.615 | 32.385 | 124.352 | 7.6796 | 1.0184 |
+| 3.975 | 320.952 | 29.048 | 110.203 | 7.5878 | 1.0062 |
+| 4.975 | 323.926 | 26.074 | 98.521 | 7.5570 | 1.0022 |
+| 5.975 | 326.589 | 23.411 | 88.338 | 7.5466 | 1.0008 |
+| 6.975 | 328.978 | 21.022 | 79.286 | 7.5431 | 1.0003 |
+| 7.975 | 331.123 | 18.877 | 71.186 | 7.5420 | 1.0002 |
+| **8.975** | 333.049 | 16.951 | 63.920 | **7.5416** | **1.0001** |
+| 9.975 | 334.800 | 15.200 | 57.465 | 7.5611 | 1.0027 |
+
+**Nu = 7.5416 against the exact 7.5407: +0.012 %.** The approach is monotonic
+from above through the thermal entry region and flattens from x = 6 m onward,
+which is the behaviour the Graetz solution has and is itself evidence that the
+station is in the developed region rather than a coincidence at one point.
+
+Two features of the table are worth naming rather than glossing over. The last
+station, x = 9.975 m, reads 7.5611 and is the only one that breaks the trend:
+`zeroGradient` on `T` at the outlet forces the streamwise gradient to zero in
+the last column, where physically it is still positive, and that perturbs the
+last few cells. It is an artefact of the outlet condition, not of the energy
+equation, and it is why the tutorial quotes x = 8.975 m. And the computed
+7.5416 sits *below* the 7.5430 that the post-processor returns on the exact
+field, so the solver's own discretisation error and the post-processor's are of
+opposite sign and partly cancel; the honest reading is that both are of order
+0.03 % and the agreement with 7.5407 to 0.012 % is not better than either
+error separately.
+
+Repeating the case at `residualControl U 1e-10 / p 1e-10 / T 1e-12` - 28 outer
+iterations instead of 11 - gives 7.5416 at the same station, to four decimal
+places. The result is converged, not a stopping artefact.
+
+The case is sized so that the three assumptions behind the benchmark all hold
+at once, and this is the part of the exercise that is easy to get wrong rather
+than the implementation: the flow must be hydrodynamically developed (entry
+length 0.05*Re*Dh = 2 m, against stations at 6 m and beyond); axial conduction
+must be negligible (the ratio to axial convection is about 7.54/Pe_H^2 = 0.15 %
+at Pe_H = u*H/alpha = 70, which is why Pr is 7 and not 0.71 - at Pe = 14 the
+asymptote moves towards the low-Peclet limit of 8.117 and the case would
+reproduce the wrong number for the right reason); and `Tw - Tb` must still be
+resolvable at the measuring station, which it is, at about a quarter of its
+inlet value at the outlet.
+
+The constant-heat-flux counterpart is a second, independent analytical value.
+For parallel plates with equal constant flux on both walls the fully developed
+profile has a closed form,
+
+```
+T(y) - Tw = (C/alpha)*(y^3 - y^4/2 - y/2),    C = dTb/dx = 2*alpha*g/(u*H)
+```
+
+whose Nusselt number is exactly 8.235294. The same calibration applies: that
+profile sampled on this mesh and passed through the post-processor gives
+8.2377, +0.033 %. Setting the wall condition to `fixedGradient` with
+`gradient 175` and changing nothing else gives **8.2466 at x = 9.025 m**, 0.11 % above the calibrated 8.2377 and 0.14 % above the exact 8.2353. The station matters more here than in the isothermal case: the wall temperature rises linearly for ever under a constant flux, so the `zeroGradient` outlet is a genuine perturbation over the last few columns (8.2828 at x = 9.975) and the entry region is longer (8.7484 at x = 3.025, 8.3615 at 5.025, 8.2695 at 7.025). The approach is monotonic from above and lands on the calibrated value. The bulk temperature
+gradient is a third check with a closed form, `dTb/dx = 2*alpha*g/(u*H)`,
+which for this case is exactly 5 K/m: measured 4.99963 K/m between x = 5.025 and x = 9.025, -0.007 %. Taking the last station instead gives 5.0105, +0.21 %, which is the same outlet effect and not a different result.
+
+### 7.3 Discrete energy conservation
+
+Every outer iteration prints
+
+```
+coupled energy check: wall heat flux = 1.7944553015, enthalpy outflow = 1.73999043168, boundary diffusion = 1.73999043164, imbalance = 2.36837395898e-09 %
+```
+
+Summing the assembled equation over every cell telescopes the internal faces
+away and leaves exactly two boundary sums - the convective outflow
+`sum(phi_b*T_b)` and the diffusive influx
+`sum(alphaEff_b*|Sf|_b*snGrad(T)_b)` - so on a converged solution they must be
+equal. Both are taken with the boundary conditions' own gradient coefficient
+functions, so they are the fluxes the matrix used rather than a reconstruction
+of them, exactly as section 2's continuity check uses the same expression as
+the assembly.
+
+On the tutorial the imbalance sits between **1.5e-11 % and 2.4e-09 %** over
+every one of the eleven outer iterations, with no drift: the individual values
+are -1.5e-11, -1.8e-09, -1.8e-09, +1.2e-09, -1.3e-09, -1.6e-10, -2.2e-09,
++8.2e-10, +9.9e-10, +2.4e-09 %. It is a linear-solver tolerance and not a
+physical residual - the `T` equation is solved to `tolerance 1e-12` on a field
+of order 300 K, i.e. about 1e-14 relative, against boundary sums of order 1.7 -
+and it changes sign from iteration to iteration as roundoff does.
+
+Two of the boundary-condition cases in 7.4 close it more sharply still, because
+their answers are exactly representable: with adiabatic walls the wall heat
+flux is **exactly 0** and with `fixedGradient 175` on both walls it is
+**exactly 2.5 K m3/s**, which is `2*alpha*g*A_wall = 2*(0.1/7)*175*0.5`, to
+every printed digit.
+
+This is the energy analogue of section 2, and it has the same two legitimate
+exceptions, plus one that is specific to a ratio: the imbalance is meaningless
+while the run is far from converged; on a non-orthogonal mesh the explicit
+non-orthogonal correction of the laplacian sits outside the identity, so the
+floor there is the size of that correction rather than roundoff; and when both
+sums are themselves zero - the adiabatic case, where they are 2.7e-14 and
+2.6e-15 - the *percentage* is a ratio of two roundoff-level numbers and means
+nothing, while the absolute values it is formed from are the meaningful
+statement.
+
+### 7.4 Boundary conditions
+
+Each of the wall conditions in `doc/USAGE.md` 9.4 was run on this case and
+checked against something that does not depend on the implementation.
+
+| Condition | Check | Result |
+| --- | --- | --- |
+| `fixedValue` (isothermal) | Nu = 7.5407 | **7.5416, +0.012 %** (7.2) |
+| `zeroGradient` (adiabatic) | `T` must stay exactly at the inlet value everywhere, and the wall heat flux exactly zero | `T` is **exactly** 300 K in all 8 000 cells - `max abs(T - 300) = 0.000e+00`, not merely small - and the wall heat flux is exactly 0. This is the discrete conservation statement in its sharpest form: a constant field with constant boundary values is an exact solution of the assembled equation only if the flux the convection term is built on is divergence free cell by cell |
+| `fixedGradient` (prescribed flux) | Nu = 8.235 and the closed-form bulk gradient | wall heat flux exactly 2.5 K m3/s, the analytical `2*alpha*g*A_wall`; energy imbalance 6.4e-11 %; Nu = 8.2466 against a calibrated 8.2377; bulk gradient -0.007 % from the closed form |
+| `symmetry` | a half-channel with a symmetry plane on the centreline must reproduce the lower half of the full channel cell for cell | the half-channel wall heat flux is 0.897227658459 K m3/s against exactly half
+the full channel's 1.79445531882, i.e. **1.1e-09 relative** - the symmetry
+plane carries exactly zero heat flux. The temperature fields agree to
+max 1.77e-05 K and rms 2.40e-06 K over the 4 000 shared cells |
+
+The symmetry row needs one qualification, and it is about the flow rather than
+the energy equation. The half-channel and full-channel velocity fields differ
+by up to 2.55e-05 in `Ux`, and that figure barely moves when both runs are
+tightened from `U 1e-5` to `U 1e-10`, so it is not a convergence artefact: the
+momentum diagonal `aP` picks up the symmetry patch's `internalCoeffs` in the
+half mesh where the full mesh has an off-diagonal link to the mirror cell.
+Those are equivalent in the residual but not in `aP`, and `aP` sets the
+Rhie-Chow coefficient `rAU`, so the damping differs by O(h) in the single row
+of cells next to the plane. That is the same class of difference section 3
+attributes to the Rhie-Chow definition, it predates the energy equation, and it
+is what the remaining 1.77e-05 K in `T` is inherited from. The energy
+equation's own contribution to this comparison - zero flux through the
+constraint patch - is the 1.1e-09 figure above.
+
+`externalWallHeatFluxTemperature` is **not usable** and this was confirmed by
+running it: it belongs to the thermophysical transport framework and looks up a
+`kappaEff` that a passive-scalar run does not register, so it fails at start-up.
+`doc/USAGE.md` 9.4 gives the `fixedGradient` and `mixed` equivalents of its two
+useful modes. `wedge` (axisymmetric) patches remain untested for the energy
+equation as they are for the flow (section 10).
+
+### 7.5 Parallel
+
+The energy step has two pieces of parallel-specific code: the balance sums skip
+`coupled()` patches, because processor and cyclic faces are internal faces of
+the global mesh and telescope away like any other, and the three sums are then
+reduced across ranks. Both are checked the same way section 4 checks the flow -
+by running the same case serially and under MPI and comparing cell by cell.
+
+On `heatedDuct` at 4 ranks (`simple` decomposition, `4 1 1`, PETSc backend):
+
+| Quantity | Serial | 4 ranks |
+| --- | --- | --- |
+| outer iterations | 11 | 11 |
+| wall heat flux, K m3/s | 1.7944553015 | 1.7944554468 |
+| max abs(dT) over all 8 000 cells | - | 1.00e-09 K |
+| rms abs(dT) | - | 3.55e-10 K |
+| wall heat flux difference | - | 2.0e-11, 1.1e-11 relative |
+
+The iteration count is identical, not within one, which is the requirement
+section 4 sets. The 1e-09 K field agreement is at the floor set by
+`writePrecision 12` on values of order 300, so it is a reproduction rather than
+an approximation.
+
+### 7.6 What this does not establish
+
+- **The flow is unaffected, and that is verified rather than argued.** With
+  `solveEnergy` absent and with `solveEnergy no` written explicitly, the four
+  existing tutorials produce logs that are identical line for line to the
+  pre-change build, `stripChannel`'s inlet pressure drop included to every
+  printed digit. That is the evidence that the passive-scalar claim holds in
+  the code and not only on paper.
+- **Only laminar heat transfer is validated.** No RANS case with
+  `solveEnergy` has been run. The turbulent heat flux is the constant-`Prt`
+  gradient diffusion hypothesis with no thermal wall function, and on a
+  wall-function mesh that is a known systematic error rather than a small one.
+- **No buoyancy, and nothing detects its absence.** The passive-scalar
+  structure is exact only while the flow does not depend on the temperature.
+  A case where it does will converge and produce a wrong answer silently.
+- **One mesh, one topology, one Prandtl number.** The energy equation has been
+  exercised on a single orthogonal structured mesh. Non-orthogonal meshes,
+  unstructured meshes and the interrupted-fin topologies of the other
+  tutorials have not been run with `solveEnergy` on.
+- The comparison in 7.1 is against OpenFOAM's own function object, which
+  shares OpenFOAM's discretisation. It establishes that the solver assembles
+  and solves the intended equation on the intended flux; the independent
+  statement about whether that equation is right is 7.2.
+
+---
+
+## 8. Defects found and fixed during verification
 
 Two assembly defects and one configuration defect were found and corrected
 during verification. They are recorded here because each one is a trap a
 reimplementation would fall into, and because the way each was detected says
 something about which check is load-bearing.
 
-### 7.1 Constraint-patch mass leak on non-axis-aligned faces
+### 8.1 Constraint-patch mass leak on non-axis-aligned faces
 
 **Symptom.** The first run of the 483,000-cell 3-D interrupted-fin unit cell
 (snappyHexMesh, maximum non-orthogonality 80.9 degrees, 5,408 skew faces)
@@ -597,7 +956,7 @@ After the fix the entire remaining discrepancy on the 3-D case is attributable
 to the documented Rhie-Chow damping definition of section 3, which is the
 outcome that says the fix is complete rather than merely improving.
 
-### 7.2 Patch diagonal counted twice
+### 8.2 Patch diagonal counted twice
 
 **The hazard.** Two different diagonal quantities are in play and they are easy
 to conflate:
@@ -634,7 +993,7 @@ for `Df` and for nothing else. The assembly carries an explicit note to that
 effect at the cell loop, because the two quantities have deceptively similar
 names and a well-intentioned refactor reintroduces the defect.
 
-### 7.3 A linear-solver default validated on one mesh topology only
+### 8.3 A linear-solver default validated on one mesh topology only
 
 Not an assembly defect, but a verification finding worth the same weight,
 because it changed a shipped default.
@@ -670,7 +1029,7 @@ Two lessons carry forward:
 
 ---
 
-## 8. Comparison with the published literature
+## 9. Comparison with the published literature
 
 No claim here is a formal benchmark against digitised reference data; these are
 qualitative agreements with published behaviour, which is what they are worth.
@@ -690,12 +1049,15 @@ assembly predicts three things, all three of which are reproduced:
 1. *A large reduction in outer iterations.* Measured at 7.8x to 200x across the
    laminar suite (for example 12 against 2,400 on the 128 x 128 cavity, 22
    against 843 on the backward-facing step, 20 against 142 on the 3-D unit
-   cell).
+   cell, and 29 against 555 on the 2,150,400-cell three-dimensional duct).
 2. *Outer-iteration counts that are largely mesh-independent.* Measured at 12
    outer iterations on cavities of 4,096, 16,384 and 65,536 cells - a 16-fold
    range - while SIMPLE goes from 797 to 2,400 over the first factor of four
    alone. The reference prototype shows the same signature independently
-   (149 -> 284 for SIMPLE under refinement, 27 to 31 for coupled).
+   (149 -> 284 for SIMPLE under refinement, 27 to 31 for coupled). The same
+   signature holds in three dimensions at production size: over the four-point
+   refinement of section 3 the coupled count moves 21 -> 24 -> 25 -> 29 while
+   the segregated count on the identical meshes moves 221 -> 296 -> 404 -> 555.
 3. *No under-relaxation factors.* The solver has no p-U relaxation factor at all
    and converges on every geometry tested without one, including cases where the
    segregated algorithm diverges at moderately aggressive relaxation.
@@ -707,6 +1069,28 @@ block system failed outright (killed at 20 minutes for a single outer
 iteration), and hypre's scalar BoomerAMG on the whole system diverges at the
 inner iteration cap. What works is a scalar AMG on the *Schur complement*, which
 is the route this solver takes.
+
+The positive half of the same position has since been measured, at 8.6 million
+unknowns, and it holds without being economical. Giving hypre block
+interpolation and a nodal Schwarz smoother on that matrix improves the residual
+after three outer iterations sixteen-fold over plain nodal coarsening, so block
+awareness does what the literature says it does; but it costs 363 to 370 seconds
+per outer iteration against 98.7 for the Schur splitting, the nodal systems-AMG
+variants are slower still (389 s and 684 s) and barely move the residual at all,
+and GAMG with unsmoothed aggregation and a block Jacobi smoother diverges with
+NaN on its first application. Diagonal equation scaling lifts the best block
+configuration to 292 s while degrading the adopted Schur configuration from
+98.7 s to 196.7 s. Monolithic block AMG is therefore measured and rejected on
+this system rather than outstanding: assembled from generic library components
+it costs three to four times more per iteration than the Schur splitting, and a
+competitive one needs purpose-built coarsening, interpolation and smoothers.
+Those measurements are only meaningful because every run passed
+`-pc_hypre_boomeramg_numfunctions 4`. PETSc does not forward the matrix block
+size to hypre - `MatSetBlockSize(A,4)` only sets the default value of an option
+whose hypre call is guarded by a flag test - so without that option hypre runs
+at `num_functions = 1` and every systems-AMG setting silently degenerates to the
+scalar case that was already known to fail. Every run also carried
+`-options_left`, which reported no unused options.
 
 **Pseudo-transient continuation: ANSYS Fluent Theory Guide section 23.4.3.2 and
 User's Guide section 37.3.** The documented role of pseudo-transient
@@ -724,9 +1108,9 @@ comparison baseline reproducible from this repository.
 
 ---
 
-## 9. What is not validated
+## 10. What is not validated
 
-This section is deliberately exhaustive. Anything not listed in sections 2 to 6
+This section is deliberately exhaustive. Anything not listed in sections 2 to 7
 should be assumed untested.
 
 ### Physics and equation scope
@@ -737,11 +1121,24 @@ should be assumed untested.
   validated as time accuracy.
 - **Incompressible, single-phase, constant density.** The pressure is
   kinematic. No compressible support, no multiphase, no free surface.
-- **No energy equation**, no conjugate heat transfer, no buoyancy.
+- **Heat transfer is a passive scalar only** (section 7). Temperature is
+  transported by the flow and never acts on it, so **buoyancy is absent**:
+  natural and mixed convection are outside the model and nothing in the run
+  will say so. Properties are constant - no temperature-dependent viscosity,
+  density or conductivity - and there is no viscous heating, no compression
+  work, no conjugate heat transfer with a solid region, no radiation and no
+  volumetric source. The turbulent heat flux is the constant-`Prt` gradient
+  diffusion hypothesis with **no thermal wall function**, and no RANS heat
+  transfer case has been run at all: section 7 is entirely laminar.
 - **No formal order-of-accuracy or grid-convergence study.** The discretisation
   is OpenFOAM's own, and the verification strategy is equivalence to the
   segregated solver rather than an independent demonstration of formal order.
   No Richardson extrapolation or mesh-refinement error study has been performed.
+  The four-point refinement of section 3 does not close this gap: it measures
+  how the *difference between the two solvers* behaves under refinement, both of
+  them carrying the same discretisation error, and is evidence for the Rhie-Chow
+  attribution rather than a statement about either solver's error against an
+  exact or extrapolated solution.
 - **No comparison against experimental data.** Every comparison here is
   code-to-code.
 
@@ -817,15 +1214,49 @@ should be assumed untested.
 - **No preconditioner is universal.** The shipped default is the only one
   measured to be both fast and robust on every topology tested, but the
   selection remains a per-case decision made through `petscOptions`, and a new
-  topology is a new experiment.
+  topology is a new experiment. The default is a robustness choice and is paid
+  for in wall clock at size: the `selfp` Schur approximation rebuilds an
+  explicit sparse matrix product every outer iteration and costs 555 s per
+  outer iteration at 8.6 million unknowns, against 98.7 s for
+  `-pc_fieldsplit_schur_precondition a11`, which reuses the pressure block the
+  assembly already builds. On small or highly non-orthogonal meshes `selfp`
+  remains the more robust of the two, which is why it stays the default.
 - **`relTol` cannot be tuned once and forgotten.** Four regimes have four
   different measured recommendations (small laminar, large laminar with
   pseudo-transient continuation, small RANS, large RANS). Getting it wrong
   either stalls the outer loop or makes each outer iteration intractable. See
-  `doc/USAGE.md`.
-- **`reusePreconditioner` is measurably counterproductive** and is off by
-  default; the Picard operator changes too fast between outer iterations for a
-  stale preconditioner to pay for itself.
+  `doc/USAGE.md`. `adaptiveTolerance` removes the choice on large
+  three-dimensional cases but replaces it with `relTolMax`, which carries the
+  same regime dependence: 3e-2 is the measured value on the large
+  three-dimensional benchmark and is too loose on small two-dimensional ones.
+- **`reusePreconditioner` is measurably counterproductive** on the cases where
+  it was measured and is off by default; freezing the preconditioner after the
+  first build does not pay, because the Picard operator changes too fast between
+  outer iterations for a stale preconditioner to be worth its reduced quality.
+  The separate `pcReuseInterval` path, which rebuilds every N-th outer iteration
+  rather than never, does pay on large three-dimensional cases with a cheap
+  hierarchy, and the two are not interchangeable: when both are set the older
+  freeze wins.
+- **`adaptiveTolerance` and `pcReuseInterval` are regression tested, not
+  independently validated at scale.** Both are off by default and both have been
+  regression tested against the shipped tutorials, which is what establishes
+  that leaving them off reproduces the previous logs byte for byte and that
+  switching them on does not move the converged answer of those cases. Beyond
+  that, the evidence for them is a single benchmark geometry - the
+  2,150,400-cell duct and its four-point refinement - on one machine at one rank
+  count. Neither the Eisenstat-Walker forcing sequence nor the reuse interval
+  has been exercised on a second large three-dimensional topology, on a
+  non-orthogonal 3-D mesh, or under RANS at that size. The tuned settings are a
+  measured starting point, not a validated default, which is why they are not
+  the defaults.
+- **The adaptive path changes the inner convergence test, and that change is
+  covered by the same evidence.** An Eisenstat-Walker tolerance is defined
+  against the current iterate, so the adaptive path switches the KSP test to the
+  initial-residual norm (`KSPConvergedDefaultSetUIRNorm`); under PETSc's default
+  test relative to `abs(b)`, a warm-started loose solve returns after zero
+  Krylov iterations and the outer loop stalls while every printed diagnostic
+  looks healthy. The fixed-`relTol` path is unchanged and keeps the default
+  test.
 - **The pseudo-transient length scale is `V^(1/3)`**, which under-estimates the
   in-plane cell size on thin 2-D meshes. Off by default.
 - **The `Final residual` of a block whose reference response is numerically
@@ -843,29 +1274,28 @@ should be assumed untested.
 
 ### Platform-scoped results
 
-- **Every GPU conclusion is scoped to the hardware it was measured on**: one
-  workstation-class card with 1/64-rate double precision, under WSL2, with no
-  MPS available and a non-CUDA-aware MPI. On that platform the device path is
-  numerically exact but not faster - it ties the CPU at best, is about 7 per
-  cent slower at fixed preconditioner and rank count, is roughly 30 times slower
-  on small problems, and scales *inversely* with rank count because each rank
-  opens its own CUDA context on one device. None of that should be extrapolated
-  to a datacentre part, to bare-metal Linux, or to a mesh large enough that the
-  per-Picard matrix re-ship stops dominating.
-- **The AmgX findings are version- and platform-scoped** to AmgX 2.4.0 as pinned
-  by PETSc, under WSL2, with the host driver tested. Two local PETSc source
-  changes were needed to get that far; they were **not** submitted upstream and
-  are unverified against current PETSc.
-- **Wall-clock competitiveness is not claimed.** At production tolerances on the
-  483,000-cell 3-D case the best coupled configuration is about 2.2 times behind
-  the segregated solver in wall clock while using 24 outer iterations against
-  142. The coupled solver's demonstrated advantages are deep convergence that
-  the segregated solver cannot reach on that mesh at any cost, zero-relaxation
-  robustness, and mesh-independent iteration counts - not raw speed.
+- **Where wall clock is concerned, the crossover is what is scoped, not the
+  answer.** The earlier measurement on the 483,000-cell 3-D case, with the
+  configuration and defaults of the time, put the best coupled run about 2.2
+  times behind the segregated solver in wall clock while using 24 outer
+  iterations against 142. That figure stands as a record of that case at that
+  stage of tuning; it is not the current position. On the 2,150,400-cell
+  three-dimensional duct the tuned configuration of `doc/BENCHMARKS.md`
+  section 9.2 converges in 203 s against the segregated solver's 478 s to the
+  same criteria - 2.3 times faster, with the accuracy evidence of section 3 -
+  and the four-point sweep of section 3 puts the crossover near 300,000 cells.
+  What that crossover is scoped to is one ten-core workstation, ten ranks, one
+  laminar three-dimensional topology and these two configurations: a different
+  machine, a different topology, a RANS case, or an untuned coupled
+  configuration will move it, and below the crossover the segregated solver
+  remains the faster of the two. The advantages that do not depend on size are
+  unchanged - deep convergence the segregated solver cannot reach on the
+  483,000-cell mesh at any cost, zero-relaxation robustness, and
+  mesh-independent iteration counts.
 
 ---
 
-## 10. Re-running the verification
+## 11. Re-running the verification
 
 Nothing in this document requires special tooling. Build the solver, run the
 tutorials, and compare fields with the script in `tools/`.
@@ -881,7 +1311,7 @@ tutorials, and compare fields with the script in `tools/`.
 `./Allrun` runs every case under `tutorials/`, writes each case's console output
 to `<case>/log.Allrun`, prints a pass/fail summary and exits non-zero if any
 case failed. A case counts as failed when its own `Allrun` exits non-zero or
-when `FOAM FATAL ERROR` appears in any of its logs. The four tutorials are a lid-driven cavity, a
+when `FOAM FATAL ERROR` appears in any of its logs. The five tutorials are a lid-driven cavity, a
 2-D interrupted-fin strip channel in laminar and kOmegaSST form, and a 3-D
 interrupted-fin duct.
 
@@ -891,7 +1321,11 @@ interrupted-fin duct.
   should sit at machine precision (order 1e-16 relative to the characteristic
   flux) from the first iteration onwards. Anything above about 1e-10 relative
   means either an assembly inconsistency or an inner solve that did not
-  converge - check `relTol` before suspecting the assembly.
+  converge - check `relTol` before suspecting the assembly. A configuration that
+  deliberately solves the inner systems loosely reads higher for that reason
+  alone: the tuned large-case settings of `doc/BENCHMARKS.md` section 9.2 sit
+  at about 1e-9 normalised while agreeing with the segregated solver to 0.014
+  per cent on `dp`.
 - `COUPLED solution converged in N iterations`. Compare `N` against section 4
   when changing rank count: it should not move at all in laminar cases.
 - The pressure-level line at start-up, either

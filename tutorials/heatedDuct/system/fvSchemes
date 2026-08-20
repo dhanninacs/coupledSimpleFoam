@@ -1,0 +1,40 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      fvSchemes;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+ddtSchemes  { default steadyState; }
+gradSchemes { default Gauss linear; }
+
+divSchemes
+{
+    default                       none;
+    div(phi,U)                    bounded Gauss upwind;
+    div((nu*dev2(T(grad(U)))))    Gauss linear;
+    div(devTauCorrFlux)           Gauss linear;
+
+    // Energy equation.  Second-order upwind rather than first-order upwind:
+    // the streamwise numerical diffusion of `Gauss upwind` at this cell size
+    // is u*dx/2 = 0.025 m2/s against a molecular alpha of 0.0143 m2/s, which
+    // is enough to move the fully developed Nusselt number by a few tenths of
+    // a percent.  The segregated reference of doc/VALIDATION.md 5 reads this
+    // same entry, so the comparison is unaffected either way.
+    div(phi,T)                    Gauss linearUpwind grad(T);
+}
+
+laplacianSchemes     { default Gauss linear corrected; }
+interpolationSchemes { default linear; }
+snGradSchemes        { default corrected; }
+
+// ************************************************************************* //

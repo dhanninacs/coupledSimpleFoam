@@ -48,18 +48,19 @@ Description
                           -pc_fieldsplit_type schur";
         }
 
-    When built against a CUDA-enabled PETSc (PETSC_CUDA=1, see Make/options)
-    the same string switches the whole linear-algebra path onto the GPU:
+    This code is device agnostic.  MatSetFromOptions and VecSetFromOptions are
+    called after the default types are set, so a build linked against a PETSc
+    configured for a device runs the whole linear-algebra path there simply by
+    naming device matrix and vector types in the same string, and the COO
+    assembly below is already the PETSc device-assembly API and is unchanged.
+    Nothing in this repository builds that configuration; a companion project
+    supplies it and documents the options that go with it.
 
-        petscOptions "-mat_type aijcusparse -vec_type cuda ...";
+    Note that -use_gpu_aware_mpi and -log_view are consumed by PetscInitialize
+    and therefore CANNOT be set here: the first is defaulted in the
+    constructor, the second must come from PETSC_OPTIONS.
 
-    because MatSetFromOptions/VecSetFromOptions are called after the default
-    types are set.  The COO assembly below is already the PETSc GPU assembly
-    API and is unchanged.  Note that -use_gpu_aware_mpi and -log_view are
-    consumed by PetscInitialize and therefore CANNOT be set here; the first is
-    defaulted in the constructor, the second must come from PETSC_OPTIONS.
-    See doc/INSTALL.md for the CUDA build and doc/USAGE.md for the runtime
-    options.
+    See doc/USAGE.md for the runtime options.
 
 SourceFiles
     petscCoupledSolver.C
@@ -106,6 +107,21 @@ class petscCoupledSolver
         //- Freeze the preconditioner built on the first outer iteration
         bool reusePC_;
 
+        //- Rebuild the preconditioner every pcReuseInterval_ solves and
+        //  reuse it in between.  1 (the default) rebuilds every outer
+        //  iteration, which is the historical behaviour.  Ignored when
+        //  reusePC_ is set, which freezes it outright.
+        label pcReuseInterval_;
+
+        //- Number of solves performed (== outer iterations, since the outer
+        //  loop calls solve() exactly once per iteration)
+        label nSolves_;
+
+        //- True once the outer loop has pushed an adaptive relative
+        //  tolerance, which also selects the initial-residual-relative KSP
+        //  convergence test (see setRelTol and solve)
+        bool adaptiveRelTol_;
+
 
 public:
 
@@ -119,6 +135,21 @@ public:
     }
 
     virtual label solve(const coupledLinearSystem& sys, scalarField& x);
+
+    //- Relative KSP tolerance for the next solve (KSPSetTolerances rtol).
+    //  Used by the adaptive (Eisenstat-Walker) inner tolerance in the outer
+    //  loop; when adaptiveTolerance is off this is never called and the
+    //  dictionary relTol stands for the whole run.
+    //
+    //  Being called at all also switches the KSP convergence test to the
+    //  initial-residual norm, because that - not PETSc's default ||b|| - is
+    //  the quantity an Eisenstat-Walker forcing term is defined against.
+    //  See the comment in solve().
+    virtual void setRelTol(const scalar rtol)
+    {
+        relTolerance_ = rtol;
+        adaptiveRelTol_ = true;
+    }
 };
 
 

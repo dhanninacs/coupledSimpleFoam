@@ -10,7 +10,7 @@ assembly, the serial direct backend, pressure pinning, and convergence on the
   `fixedValue` pressure patch exists anywhere and the pressure level of the
   coupled system is otherwise undetermined. The solver detects that, pins the
   pressure row of `pRefCell` to `pRefValue`, and says so in the log:
-  `Pressure level: pinned at global cell 0 to p = 0`. The other three tutorials
+  `Pressure level: pinned at global cell 0 to p = 0`. The other four tutorials
   take the opposite branch.
 - **Explicit backend selection.** This is the one case that sets
   `linearSolver` in the `COUPLED` dictionary, rather than leaving the solver to
@@ -60,7 +60,7 @@ mpirun -np 4 coupledSimpleFoam -parallel
 reconstructPar -latestTime
 ```
 
-The three flow-through tutorials omit `linearSolver` for exactly this reason
+The four flow-through tutorials omit `linearSolver` for exactly this reason
 and ship a ready-made `Allrun-parallel`.
 
 ## Expected outcome
@@ -110,7 +110,7 @@ vertical centreline:
 ## Runtime
 
 Seconds. On an idle machine the coupled solve takes about 0.6 s and the
-segregated reference about 7 s; meshing is well under a second. Both figures
+segregated reference about 1.6 s; meshing is well under a second. Both figures
 inflate several-fold on a loaded machine, so treat them as an order of
 magnitude rather than a benchmark.
 

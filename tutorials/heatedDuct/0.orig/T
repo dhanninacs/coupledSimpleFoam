@@ -1,0 +1,59 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       volScalarField;
+    location    "0";
+    object      T;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Read only when COUPLED/solveEnergy is on.  With the switch off this file is
+// never opened and the case runs exactly as an isothermal one.
+//
+// The temperature is a PASSIVE scalar here: constant properties and no
+// buoyancy, so nothing in this file can change the velocity or the pressure.
+
+dimensions      [0 0 0 1 0 0 0];
+
+internalField   uniform 300;
+
+boundaryField
+{
+    inlet
+    {
+        type            fixedValue;
+        value           uniform 300;
+    }
+
+    outlet
+    {
+        type            zeroGradient;
+    }
+
+    // Isothermal wall.  Swap for `zeroGradient` to make it adiabatic, or for
+    //     type            fixedGradient;
+    //     gradient        uniform 175;
+    // to impose a heat flux instead - snGrad is the OUTWARD normal gradient,
+    // so a positive value heats the fluid, and 175 K/m raises the bulk
+    // temperature by 50 K over this domain.  See README.md, which reports
+    // what each of the three conditions produces.
+    walls
+    {
+        type            fixedValue;
+        value           uniform 350;
+    }
+
+    frontAndBack
+    {
+        type            empty;
+    }
+}
+
+// ************************************************************************* //

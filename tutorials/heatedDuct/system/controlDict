@@ -1,0 +1,43 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     coupledSimpleFoam;
+
+// Read only by `foamRun`, which is how the segregated reference is produced
+// from this same case directory.  coupledSimpleFoam ignores it.
+solver          incompressibleFluid;
+
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+
+endTime         1000;
+deltaT          1;
+
+writeControl    timeStep;
+writeInterval   1000;
+purgeWrite      2;
+
+writeFormat     ascii;
+
+// 12 significant figures: the Nusselt number is computed from the difference
+// between the wall temperature and the bulk temperature, which falls to a few
+// per cent of the inlet-to-wall difference at the far end of the duct.
+writePrecision  12;
+
+runTimeModifiable no;
+
+// ************************************************************************* //

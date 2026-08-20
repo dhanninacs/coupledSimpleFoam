@@ -1,0 +1,83 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Plane channel, 10 m long and 1 m high, one cell thick.  The hydraulic
+// diameter of an infinite parallel-plate duct is Dh = 2*H = 2 m, so the
+// domain is 5 hydraulic diameters long.
+//
+// 200 x 40 uniform cells: dx = 0.05 m, dy = 0.025 m.  Uniform in y is
+// sufficient for the wall heat flux because the near-wall curvature of the
+// fully developed temperature profile is exactly zero - the energy equation
+// u dT/dx = alpha d2T/dy2 has u = 0 at a no-slip wall - so the one-sided
+// wall gradient is second-order accurate here, not first.
+
+scale 1;
+
+vertices
+(
+    (0  0 0)
+    (10 0 0)
+    (10 1 0)
+    (0  1 0)
+    (0  0 0.05)
+    (10 0 0.05)
+    (10 1 0.05)
+    (0  1 0.05)
+);
+
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) (200 40 1) simpleGrading (1 1 1)
+);
+
+boundary
+(
+    inlet
+    {
+        type patch;
+        faces
+        (
+            (0 4 7 3)
+        );
+    }
+    outlet
+    {
+        type patch;
+        faces
+        (
+            (2 6 5 1)
+        );
+    }
+    walls
+    {
+        type wall;
+        faces
+        (
+            (1 5 4 0)
+            (3 7 6 2)
+        );
+    }
+    frontAndBack
+    {
+        type empty;
+        faces
+        (
+            (0 3 2 1)
+            (4 5 6 7)
+        );
+    }
+);
+
+// ************************************************************************* //

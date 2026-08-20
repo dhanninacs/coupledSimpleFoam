@@ -102,8 +102,31 @@ Foam::petscCoupledSolver::petscCoupledSolver(const dictionary& dict)
     kspPtr_(nullptr),
     built_(false),
     nCoo_(-1),
-    reusePC_(dict.lookupOrDefault<bool>("reusePreconditioner", false))
+    reusePC_(dict.lookupOrDefault<bool>("reusePreconditioner", false)),
+    pcReuseInterval_(dict.lookupOrDefault<label>("pcReuseInterval", 1)),
+    nSolves_(0),
+    adaptiveRelTol_(false)
 {
+    if (pcReuseInterval_ < 1)
+    {
+        FatalErrorInFunction
+            << "pcReuseInterval must be >= 1 (got " << pcReuseInterval_
+            << "); 1 rebuilds the preconditioner every outer iteration"
+            << exit(FatalError);
+    }
+
+    // The two preconditioner-reuse policies overlap; reusePreconditioner is
+    // the older and stronger one (freeze after the first build), so it wins
+    // and the periodic policy is not applied on top of it.
+    if (reusePC_ && pcReuseInterval_ > 1)
+    {
+        WarningInFunction
+            << "both reusePreconditioner (freeze after the first build) and "
+            << "pcReuseInterval " << pcReuseInterval_ << " are set; "
+            << "reusePreconditioner wins and pcReuseInterval is ignored"
+            << endl;
+    }
+
     PetscBool inited = PETSC_FALSE;
     PetscInitialized(&inited);
 
@@ -319,6 +342,55 @@ Foam::label Foam::petscCoupledSolver::solve
     );
     KSPSetInitialGuessNonzero(ksp, PETSC_TRUE);
     KSPSetFromOptions(ksp);
+
+    if (adaptiveRelTol_)
+    {
+        // WHAT rtol IS MEASURED AGAINST, and why this call is not optional.
+        //
+        // PETSc's default convergence test is ||r_k|| <= rtol*||b||.  This
+        // outer loop is a Picard iteration that warm-starts every solve from
+        // the previous solution, so ||b - A x_0|| is already far below ||b||
+        // once the run is under way: at a loose rtol the test is satisfied
+        // before the first Krylov step and KSPSolve returns having done
+        // nothing at all.  The outer residual then stops moving entirely -
+        // measured on stripChannel, every solve after the first returned
+        // "No Iterations 0" and the run sat at a residual of 0.87 for 100
+        // outer iterations.  It is the same mechanism behind the plateau that
+        // doc/USAGE.md 4.1 reports for a fixed loose relTol.
+        //
+        // An Eisenstat-Walker forcing term is defined against the residual of
+        // the CURRENT iterate - the inexact-Newton condition is
+        // ||b - A x_new|| <= eta*||b - A x_old|| - so the schedule only means
+        // what it says under the initial-residual-relative test that this
+        // call selects.  It is scoped to the adaptive path: with
+        // adaptiveTolerance off, setRelTol is never called, this branch never
+        // runs, and the fixed relTol keeps its original ||b||-relative
+        // meaning and its original numbers.
+        //
+        // Must follow KSPSetFromOptions, which is what installs the default
+        // convergence test this modifies.  A no-op if the user has replaced
+        // that test through petscOptions.
+        KSPConvergedDefaultSetUIRNorm(ksp);
+    }
+
+    // Periodic preconditioner refresh.  Build on solves 0, N, 2N, ... (outer
+    // iterations 1, N+1, 2N+1, ...) and reuse in between.  The flag is
+    // explicitly turned back OFF on a rebuild iteration: freezing the
+    // preconditioner for the whole run is measured counterproductive
+    // (doc/USAGE.md 4.6), the point here is periodic refresh.  Set after
+    // KSPSetFromOptions so that an explicit -ksp_reuse_preconditioner in
+    // petscOptions cannot silently fight the dictionary key.
+    //
+    // reusePreconditioner (freeze after the first build) is applied once at
+    // setup and takes precedence, so this branch stays out of its way.
+    if (!reusePC_ && pcReuseInterval_ > 1)
+    {
+        const bool rebuild = (nSolves_ % pcReuseInterval_ == 0);
+
+        KSPSetReusePreconditioner(ksp, rebuild ? PETSC_FALSE : PETSC_TRUE);
+    }
+
+    nSolves_++;
 
     KSPSolve(ksp, b, s);
 

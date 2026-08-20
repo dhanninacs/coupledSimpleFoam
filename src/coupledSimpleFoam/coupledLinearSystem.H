@@ -223,6 +223,14 @@ public:
         scalarField& x
     ) = 0;
 
+    //- Set the relative (inner) tolerance to be used by the NEXT solve.
+    //  Called by the outer loop only when adaptiveTolerance is switched on,
+    //  which is why the default is a no-op: a backend with no relative
+    //  tolerance to set - the Eigen direct solve - simply ignores the
+    //  request and the outer loop is unaffected.  See doc/USAGE.md 2.2.
+    virtual void setRelTol(const scalar)
+    {}
+
     //- Select a backend.  "SparseLU" / "BiCGSTAB" are Eigen (serial),
     //  "PETSc" is the MPI backend.  Defaults to PETSc for a parallel run
     //  and SparseLU otherwise.

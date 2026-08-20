@@ -16,8 +16,6 @@
 #
 # Build switches, all environment variables (see doc/INSTALL.md):
 #     COUPLED_NO_PETSC=1   serial Eigen-only build, even if PETSc is installed
-#     PETSC_CUDA=1         link a CUDA-enabled PETSc named by PETSC_DIR and
-#                          PETSC_ARCH (or PETSC_CUDA_DIR / PETSC_CUDA_ARCH)
 #     EIGEN_INC            override the Eigen include flag
 #
 # The executable is installed as $FOAM_USER_APPBIN/coupledSimpleFoam.
@@ -68,10 +66,6 @@ echo "    Eigen include    : ${EIGEN_INC:--I/usr/include/eigen3 (default)}"
 
 if [ "$COUPLED_NO_PETSC" = 1 ]; then
     echo "    PETSc backend    : disabled (COUPLED_NO_PETSC=1)"
-elif [ "$PETSC_CUDA" = 1 ]; then
-    echo "    PETSc backend    : CUDA build (PETSC_CUDA=1)"
-    echo "    PETSC_DIR        : ${PETSC_CUDA_DIR:-${PETSC_DIR:-<unset, falling back to a source-build convention>}}"
-    echo "    PETSC_ARCH       : ${PETSC_CUDA_ARCH:-${PETSC_ARCH:-<unset, falling back to a source-build convention>}}"
 elif pkg-config --exists PETSc 2>/dev/null || pkg-config --exists petsc 2>/dev/null
 then
     echo "    PETSc backend    : enabled (found by pkg-config)"

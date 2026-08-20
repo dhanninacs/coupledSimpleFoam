@@ -1,0 +1,84 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  14
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// The `solvers` entry for T is read by BOTH solvers: coupledSimpleFoam solves
+// the temperature equation segregated, exactly as the segregated reference
+// does.  The p and U entries, `SIMPLE` and `relaxationFactors` are read only
+// by `foamRun -solver incompressibleFluid`, which can be run from this same
+// case directory as a reference (doc/VALIDATION.md 5).
+
+solvers
+{
+    p { solver GAMG; smoother GaussSeidel; tolerance 1e-08; relTol 0.01; }
+    U { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-07; relTol 0.1; }
+
+    // Tight and with relTol 0, so that every outer iteration returns the
+    // exact discrete solution of the temperature equation on the current
+    // flux.  The energy equation is linear in T once phi is fixed, so this
+    // costs almost nothing and removes the linear solve from every number
+    // this tutorial reports.
+    T
+    {
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-12;
+        relTol          0;
+    }
+}
+
+// ---- segregated reference: foamRun -solver incompressibleFluid -----------
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+    pRefCell        0;
+    pRefValue       0;
+
+    residualControl { p 1e-4; U 1e-5; }
+}
+
+relaxationFactors
+{
+    equations { U 0.7; }
+    fields    { p 0.3; }
+}
+
+// ---- fully coupled solver: coupledSimpleFoam ----------------------------
+COUPLED
+{
+    nOuterIterations 100;
+
+    // `outlet` is a fixedValue pressure patch, so it sets the pressure level
+    // and these two are unused.
+    pRefCell         0;
+    pRefValue        0;
+
+    // ---- heat transfer ---------------------------------------------------
+    // T is solved segregated after the coupled p-U solve, on the conservative
+    // Rhie-Chow flux that solve produced.  It is a PASSIVE scalar: constant
+    // properties and no buoyancy, so it never feeds back into the momentum
+    // equations (doc/USAGE.md 9).
+    solveEnergy      yes;
+
+    // Water-like Pr.  Prt is unused in a laminar case and is left at its
+    // default of 0.85 to show that only the keys a case needs have to appear.
+    Pr               7;
+
+    // T is checked here as well, one outer iteration in arrears, through the
+    // same mechanism the turbulence residual controls use.
+    residualControl { U 1e-5; p 1e-4; T 1e-6; }
+}
+
+// ************************************************************************* //

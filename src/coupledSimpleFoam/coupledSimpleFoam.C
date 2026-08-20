@@ -80,6 +80,15 @@ Description
         "relaxationFactors" entries, exactly as SIMPLE does, and their
         residual lines appear in the log in the standard format.
 
+    7.  Optionally (COUPLED/solveEnergy, default off) a temperature equation
+            fvm::div(phi, T) - fvm::laplacian(alphaEff, T)
+        with alphaEff = nu/Pr + nut/Prt is solved segregated on that same
+        conservative flux, in the same way and with the same relaxation and
+        residual-control machinery as the turbulence equations.  For constant
+        properties and no buoyancy T is a PASSIVE scalar: it never feeds back
+        into the momentum rows, so with the switch off - or on - the coupled
+        p-U assembly above is bit-for-bit the same.
+
     The linear system is assembled backend-agnostically as COO triplets with
     GLOBAL row/column indices (4*globalCell + component), so the same
     assembly feeds the serial Eigen backend and the MPI PETSc backend.
@@ -107,6 +116,7 @@ Description
 #include "symmetryFvPatch.H"
 #include "symmetryPlaneFvPatch.H"
 #include "wedgeFvPatch.H"
+#include "wallFvPatch.H"
 #include "slipFvPatchFields.H"
 #include "viscosityModel.H"
 #include "incompressibleMomentumTransportModel.H"
@@ -122,15 +132,18 @@ int main(int argc, char *argv[])
     #include "setRootCase.H"
     #include "createTime.H"
     #include "createMesh.H"
-    #include "createFields.H"
 
     // ------------------------------------------------------------ controls
+    // Read before the fields, because COUPLED/solveEnergy decides whether the
+    // temperature field is constructed at all.
     const dictionary coupledDict
     (
         mesh.solution().found("COUPLED")
       ? mesh.solution().subDict("COUPLED")
       : dictionary::null
     );
+
+    #include "createFields.H"
 
     const label nOuterIterations =
         coupledDict.lookupOrDefault<label>("nOuterIterations", 100);
@@ -151,16 +164,54 @@ int main(int argc, char *argv[])
     const scalar rcFactor =
         coupledDict.lookupOrDefault<scalar>("rhieChowFactor", 1.0);
 
+    // ------------------------------- adaptive inner tolerance (Eisenstat-
+    // Walker).  The inner Krylov solve does not need to be accurate while
+    // the outer Picard iteration is still far from the solution: the forcing
+    // term below is loose early and tightens as the NONLINEAR residual falls,
+    // which is what avoids both failure modes documented in USAGE 4.1 - a
+    // fixed loose tolerance plateaus the outer loop, a fixed tight one makes
+    // every outer iteration unaffordable.  Off by default, so an existing
+    // case is bit-for-bit unaffected: with the switch off no tolerance is
+    // ever pushed to the backend and the dictionary relTol stands alone.
+    const Switch adaptiveTolerance
+    (
+        coupledDict.lookupOrDefault<Switch>("adaptiveTolerance", Switch(false))
+    );
+    const scalar relTolMax =
+        coupledDict.lookupOrDefault<scalar>("relTolMax", 1e-1);
+    const scalar relTolMin =
+        coupledDict.lookupOrDefault<scalar>("relTolMin", 1e-8);
+    const scalar adaptiveGamma =
+        coupledDict.lookupOrDefault<scalar>("adaptiveGamma", 0.9);
+    const scalar adaptiveAlpha =
+        coupledDict.lookupOrDefault<scalar>("adaptiveAlpha", 1.5);
+
+    if (adaptiveTolerance)
+    {
+        if (relTolMin > relTolMax)
+        {
+            FatalErrorInFunction
+                << "relTolMin (" << relTolMin << ") exceeds relTolMax ("
+                << relTolMax << ")" << exit(FatalError);
+        }
+
+        Info<< "Adaptive inner tolerance (Eisenstat-Walker): relTol in ["
+            << relTolMin << ", " << relTolMax << "], gamma "
+            << adaptiveGamma << ", alpha " << adaptiveAlpha << nl << endl;
+    }
+
     scalar resControlU = 1e-5;
     scalar resControlP = 1e-4;
 
     // Any residualControl key that is not U or p is taken to be a segregated
-    // (turbulence) field solved by momentumTransport->correct().  Its initial
-    // residual is read back from OpenFOAM's own per-time-step residual store
-    // through convergenceControl, which is what SIMPLE/PIMPLE use, so the
-    // criterion means exactly the same thing as in the segregated solver.
-    // Fields that are never solved are simply not checked (again as in
-    // convergenceControl::criteriaSatisfied).
+    // field - a turbulence field solved by momentumTransport->correct(), or T
+    // when solveEnergy is on.  Its initial residual is read back from
+    // OpenFOAM's own per-time-step residual store through convergenceControl,
+    // which is what SIMPLE/PIMPLE use, so the criterion means exactly the same
+    // thing as in the segregated solver.  Fields that are never solved are
+    // simply not checked (again as in convergenceControl::criteriaSatisfied),
+    // which is why a stale `T 1e-6` left in a case with solveEnergy off is
+    // inert rather than a run that can never converge.
     DynamicList<word> extraResName;
     DynamicList<scalar> extraResTol;
 
@@ -431,6 +482,11 @@ int main(int argc, char *argv[])
 
     label iter = 0;
     bool converged = false;
+
+    // Eisenstat-Walker state: the nonlinear residual and the forcing term of
+    // the previous outer iteration.  Negative means "not measured yet".
+    scalar ewResPrev = -1.0;
+    scalar ewEtaPrev = -1.0;
 
     while (iter < nOuterIterations)
     {
@@ -861,6 +917,53 @@ int main(int argc, char *argv[])
             break;
         }
 
+        // ================================ adaptive inner tolerance (E-W)
+        // The nonlinear residual driving the forcing term is the SAME
+        // normalised block residual the convergence test above uses, reduced
+        // to one number by taking the worst block - no second measure is
+        // introduced, so the schedule is tied to exactly the quantity the run
+        // is judged on.  Nothing here runs, and nothing is pushed to the
+        // backend, unless adaptiveTolerance is on.
+        if (adaptiveTolerance)
+        {
+            const scalar ewRes =
+                max(max(res0[0], res0[1]), max(res0[2], res0[3]));
+
+            scalar eta = relTolMax;
+
+            if (iter > 1 && ewResPrev > 0 && ewEtaPrev > 0)
+            {
+                // std::pow, not pow: Foam::pow(dimensionedScalar, ...) makes
+                // the unqualified call ambiguous, exactly as Foam::cbrt does
+                // in the pseudo-transient block above.
+                eta = adaptiveGamma*std::pow(ewRes/ewResPrev, adaptiveAlpha);
+
+                // Standard safeguard against over-loosening: do not let the
+                // forcing term drop faster than the previous one squared-ish
+                // when that previous term was still large.
+                const scalar ewSafe =
+                    adaptiveGamma*std::pow(ewEtaPrev, adaptiveAlpha);
+
+                if (ewSafe > 0.1)
+                {
+                    eta = max(eta, ewSafe);
+                }
+            }
+
+            eta = min(relTolMax, max(relTolMin, eta));
+
+            lsolver->setRelTol(eta);
+
+            // Separate line, deliberately not in the "Solving for" format, so
+            // foamLog and PyFoam residual parsing is untouched.
+            Info<< "adaptive inner tolerance: relTol = " << eta
+                << ", nonlinear residual = " << ewRes
+                << ", previous = " << ewResPrev << endl;
+
+            ewResPrev = ewRes;
+            ewEtaPrev = eta;
+        }
+
         // ====================================================== SOLVE
         xNew = xOld;
         const label nLinIter = lsolver->solve(sys, xNew);
@@ -1109,6 +1212,118 @@ int main(int argc, char *argv[])
         // are no-ops, which is why the laminar path is bit-for-bit unchanged.
         viscosity->correct();
         momentumTransport->correct();
+
+        // ================================== segregated energy transport
+        // Solved on the SAME conservative Rhie-Chow flux the coupled system
+        // produced, and after the turbulence update so that nut is the one
+        // just corrected on that flux.  The equation, the relaxation lookup
+        // and the residual bookkeeping are the ones a segregated solver uses,
+        // so `foamRun -solver incompressibleFluid` plus the stock
+        // scalarTransport functionObject solves the identical discrete
+        // equation - which is what doc/VALIDATION.md 7 measures.
+        //
+        // T is a PASSIVE scalar: constant properties, no buoyancy, no
+        // viscous heating, so nothing computed here re-enters the momentum
+        // rows and the coupled assembly is untouched.  doc/USAGE.md 9 states
+        // the limits that follow.
+        if (solveEnergy)
+        {
+            volScalarField& T = TPtr();
+
+            // Simple gradient-diffusion hypothesis.  Identical to the D of
+            // the scalarTransport functionObject with alphal = 1/Pr and
+            // alphat = 1/Prt, which is what makes that function object an
+            // exact segregated reference.  nut() is a zero field for a
+            // laminar model, leaving alphaEff = nu/Pr.
+            const volScalarField alphaEff
+            (
+                "alphaEff",
+                momentumTransport->nu()/Pr + momentumTransport->nut()/Prt
+            );
+
+            fvScalarMatrix TEqn
+            (
+                fvm::div(phi, T)
+              - fvm::laplacian(alphaEff, T)
+            );
+
+            // No-op unless relaxationFactors/equations carries a T entry:
+            // with no entry fvMatrix::relaxationFactor() returns 0 and
+            // relax() returns immediately.  Same mechanism, same key and
+            // same behaviour as the turbulence equations, rather than a
+            // private relaxation control.
+            TEqn.relax();
+
+            TEqn.solve();
+
+            // Discrete energy balance, the temperature counterpart of the
+            // continuity check above and a permanent verification print.
+            // Summing the assembled equation over every cell telescopes the
+            // internal faces away and leaves exactly the boundary fluxes, so
+            // on a converged solution the net convective outflow of T must
+            // equal the net diffusive influx.  Both sums are taken with the
+            // boundary conditions' own coefficient functions, so they are the
+            // fluxes the matrix used and not a reconstruction of them (the
+            // explicit non-orthogonal correction of the laplacian is the one
+            // term outside this identity, exactly as for the pressure).
+            scalar hOut = 0.0;      // sum_b phi_b T_b       [K m^3/s]
+            scalar qBoundary = 0.0; // sum_b alphaEff |Sf| snGrad(T)
+            scalar qWall = 0.0;     // the same, wall patches only
+
+            forAll(mesh.boundary(), patchi)
+            {
+                const fvPatch& fvp = mesh.boundary()[patchi];
+
+                if (fvp.size() == 0 || fvp.coupled())
+                {
+                    continue;
+                }
+
+                const fvPatchScalarField& pT = T.boundaryField()[patchi];
+                const scalarField& pAlpha =
+                    alphaEff.boundaryField()[patchi];
+                const scalarField& pMagSf =
+                    mesh.magSf().boundaryField()[patchi];
+                const fvsPatchScalarField& pphi =
+                    phi.boundaryField()[patchi];
+                const labelUList& fc = fvp.faceCells();
+
+                const tmp<scalarField> tgIC(pT.gradientInternalCoeffs());
+                const tmp<scalarField> tgBC(pT.gradientBoundaryCoeffs());
+                const scalarField& gIC = tgIC();
+                const scalarField& gBC = tgBC();
+
+                const bool isWall = isA<wallFvPatch>(fvp);
+
+                forAll(fc, i)
+                {
+                    const scalar q =
+                        pAlpha[i]*pMagSf[i]*(gIC[i]*T[fc[i]] + gBC[i]);
+
+                    hOut += pphi[i]*pT[i];
+                    qBoundary += q;
+
+                    if (isWall)
+                    {
+                        qWall += q;
+                    }
+                }
+            }
+
+            reduce(hOut, sumOp<scalar>());
+            reduce(qBoundary, sumOp<scalar>());
+            reduce(qWall, sumOp<scalar>());
+
+            const scalar imbalance = hOut - qBoundary;
+            const scalar qScale =
+                max(max(mag(hOut), mag(qBoundary)), vSmall);
+
+            Info<< "coupled energy check: wall heat flux = " << qWall
+                << ", enthalpy outflow = " << hOut
+                << ", boundary diffusion = " << qBoundary
+                << ", imbalance = " << 100.0*imbalance/qScale << " %"
+                << endl;
+        }
 
         // Read back the initial residuals of the segregated fields for the
         // next outer iteration's convergence test

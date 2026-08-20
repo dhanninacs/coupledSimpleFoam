@@ -1,0 +1,23 @@
+#!/bin/sh
+#------------------------------------------------------------------------------
+# coupledSimpleFoam tutorial `heatedDuct` - remove all run output.
+#
+# This file is part of coupledSimpleFoam and is distributed under the GNU
+# General Public License version 3; see the LICENSE file at the root of this
+# repository.
+#
+# Leaves 0.orig, constant and system untouched, so the case is ready to run
+# again immediately afterwards.
+#------------------------------------------------------------------------------
+cd "${0%/*}" || exit 1
+
+if [ -f "$WM_PROJECT_DIR/bin/tools/CleanFunctions" ]
+then
+    . "$WM_PROJECT_DIR/bin/tools/CleanFunctions"
+    cleanCase
+fi
+
+rm -rf 0 processor* postProcessing VTK constant/polyMesh
+rm -f log.* *.OpenFOAM *.foam
+
+#------------------------------------------------------------------------------
