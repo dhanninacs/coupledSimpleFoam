@@ -125,6 +125,8 @@ Description
 #include "convergenceControl.H"
 #include "coupledLinearSystem.H"
 #include "conjugateEnergy.H"
+#include "amgxCommon.H"
+#include <cstdlib>
 
 using namespace Foam;
 
@@ -132,6 +134,21 @@ using namespace Foam;
 
 int main(int argc, char *argv[])
 {
+    #ifdef HAVE_AMGX
+    // Start CUDA (through AmgX) before anything else happens in the process:
+    // before OpenFOAM installs its signal handlers, reads the mesh or starts
+    // OpenMP threads, and while the address space is still empty. On one
+    // Windows Server 2025 host (driver 582.16) the driver's cuInit faulted
+    // when AmgX started it at the first linear solve (FoamWin issue #1).
+    // COUPLED_AMGX_LAZY=1 keeps the old start, at the first AmgX solve.
+    const char* lazy = std::getenv("COUPLED_AMGX_LAZY");
+    const bool amgxEarly = !(lazy && lazy[0] && lazy[0] != '0');
+    if (amgxEarly)
+    {
+        Foam::amgxCommon::acquire();
+    }
+    #endif
+
     #include "addRegionOption.H"
     #include "setRootCase.H"
     #include "createTime.H"
@@ -1435,6 +1452,15 @@ int main(int argc, char *argv[])
     }
 
     Info<< "End\n" << endl;
+
+    #ifdef HAVE_AMGX
+    // Drop the start-up reference; the last owner of AmgX handles (destroyed
+    // as main's objects go out of scope) finalizes the library.
+    if (amgxEarly)
+    {
+        Foam::amgxCommon::release();
+    }
+    #endif
 
     return 0;
 }
