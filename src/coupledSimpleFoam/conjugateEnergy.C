@@ -488,7 +488,11 @@ Foam::label Foam::conjugateEnergy::solveSystem(scalar initialResidual, scalar no
         // with margin, and let the caller's host check decide.
         const scalar bNorm = max(b.norm(), small);
         solver.setTolerance(std::min(0.1, 0.1*target*normFactor/(bNorm*std::sqrt(scalar(n_)))));
-        solver.compute(SpMat(A));
+        // Eigen's iterative solvers keep a reference to the matrix given to
+        // compute(): it must outlive solveWithGuess, so it is a named local
+        // (a temporary here was destroyed before the solve, FoamWin #2).
+        const SpMat Acopy(A);
+        solver.compute(Acopy);
         Eigen::VectorXd guess = x;
         x = solver.solveWithGuess(b, guess);
         return label(solver.iterations());
