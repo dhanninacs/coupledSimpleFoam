@@ -96,6 +96,8 @@ Description
 \*---------------------------------------------------------------------------*/
 
 #include <cmath>
+#include <chrono>
+#include <string>
 
 // OpenFOAM 14 no longer ships the fvCFD.H umbrella header
 #include "argList.H"
@@ -122,6 +124,7 @@ Description
 #include "incompressibleMomentumTransportModel.H"
 #include "convergenceControl.H"
 #include "coupledLinearSystem.H"
+#include "conjugateEnergy.H"
 
 using namespace Foam;
 
@@ -129,9 +132,16 @@ using namespace Foam;
 
 int main(int argc, char *argv[])
 {
+    #include "addRegionOption.H"
     #include "setRootCase.H"
     #include "createTime.H"
-    #include "createMesh.H"
+    // The mesh of -region <name> (the fluid region of a conjugate case), else
+    // the default region: createMesh.H with the region name of setRegionName.H.
+    #include "setRegionName.H"
+    Foam::fvMesh mesh
+    (
+        Foam::IOobject(regionName, runTime.name(), runTime, Foam::IOobject::MUST_READ)
+    );
 
     // ------------------------------------------------------------ controls
     // Read before the fields, because COUPLED/solveEnergy decides whether the
@@ -144,6 +154,14 @@ int main(int argc, char *argv[])
     );
 
     #include "createFields.H"
+
+    // Conjugate heat transfer: the solid regions named in COUPLED/solidRegions
+    // and the fluid's temperature solved as one system (conjugateEnergy.H).
+    autoPtr<conjugateEnergy> conjugate;
+    if (solveEnergy && coupledDict.found("solidRegions"))
+    {
+        conjugate.reset(new conjugateEnergy(mesh, TPtr(), coupledDict));
+    }
 
     const label nOuterIterations =
         coupledDict.lookupOrDefault<label>("nOuterIterations", 100);
@@ -488,9 +506,30 @@ int main(int argc, char *argv[])
     scalar ewResPrev = -1.0;
     scalar ewEtaPrev = -1.0;
 
+    const bool timing = coupledDict.lookupOrDefault<bool>("timing", false);
+    auto timerLast = std::chrono::steady_clock::now();
+    std::string timerLine;
+    auto sectionTimer = [&](const char* name)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (timing)
+        {
+            timerLine += std::string(" ") + name + " "
+                + std::to_string(std::chrono::duration<double>(now - timerLast).count());
+        }
+        timerLast = now;
+    };
+
     while (iter < nOuterIterations)
     {
         iter++;
+        sectionTimer("energy+rest");
+        if (timing && !timerLine.empty())
+        {
+            Info<< "timing:" << timerLine.c_str() << endl;
+        }
+        timerLine.clear();
+        timerLast = std::chrono::steady_clock::now();
         runTime++;
 
         Info<< "Time = " << runTime.userTimeName() << nl << endl;
@@ -585,6 +624,7 @@ int main(int argc, char *argv[])
         const volVectorField gradP(fvc::grad(p));
         const surfaceVectorField gradPf(fvc::interpolate(gradP));
 
+        sectionTimer("operators");
         // ==================================================== ASSEMBLY
         sys.clear();
         sys.reserve
@@ -868,6 +908,7 @@ int main(int argc, char *argv[])
             sys.setRowIdentity(pinRow, pRefValue);
         }
 
+        sectionTimer("assembly");
         // ================================================== RESIDUALS
         packX(xOld);
         buildRemote();
@@ -917,6 +958,7 @@ int main(int argc, char *argv[])
             break;
         }
 
+        sectionTimer("residuals");
         // ================================ adaptive inner tolerance (E-W)
         // The nonlinear residual driving the forcing term is the SAME
         // normalised block residual the convergence test above uses, reduced
@@ -964,6 +1006,7 @@ int main(int argc, char *argv[])
             ewEtaPrev = eta;
         }
 
+        sectionTimer("tolerance");
         // ====================================================== SOLVE
         xNew = xOld;
         const label nLinIter = lsolver->solve(sys, xNew);
@@ -994,6 +1037,7 @@ int main(int argc, char *argv[])
                 << ", No Iterations " << nLinIter << endl;
         }
 
+        sectionTimer("solve+residuals");
         // ================================ conservative Rhie-Chow flux
         // Uses the SAME Df and the SAME lagged gradient as the assembly,
         // so div(phi) == 0 to machine precision in every cell.
@@ -1126,6 +1170,7 @@ int main(int argc, char *argv[])
             }
         }
 
+        sectionTimer("flux");
         // ======================================== continuity reporting
         {
             scalarField divPhi(mesh.nCells(), 0.0);
@@ -1201,6 +1246,7 @@ int main(int argc, char *argv[])
                 << ", normalised = " << sumLocalNoPin/refFlux << endl;
         }
 
+        sectionTimer("continuity");
         // ================================ segregated turbulence update
         // phi has just been rebuilt from the coupled solution, so the
         // transport equations see the same conservative flux the coupled
@@ -1213,6 +1259,7 @@ int main(int argc, char *argv[])
         viscosity->correct();
         momentumTransport->correct();
 
+        sectionTimer("turbulence");
         // ================================== segregated energy transport
         // Solved on the SAME conservative Rhie-Chow flux the coupled system
         // produced, and after the turbulence update so that nut is the one
@@ -1252,9 +1299,17 @@ int main(int argc, char *argv[])
             // relax() returns immediately.  Same mechanism, same key and
             // same behaviour as the turbulence equations, rather than a
             // private relaxation control.
-            TEqn.relax();
+            if (conjugate.valid())
+            {
+                // Fluid and solids in one system; same fluid equation.
+                conjugate->solve(phi, alphaEff);
+            }
+            else
+            {
+                TEqn.relax();
 
-            TEqn.solve();
+                TEqn.solve();
+            }
 
             // Discrete energy balance, the temperature counterpart of the
             // continuity check above and a permanent verification print.

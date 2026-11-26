@@ -35,8 +35,10 @@ Description
 #include "coupledLinearSystem.H"
 #include "eigenCoupledSolver.H"
 #include "petscCoupledSolver.H"
+#include "amgxCoupledSolver.H"
 #include "Pstream.H"
 #include "error.H"
+#include "SubList.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -55,8 +57,65 @@ Foam::coupledLinearSystem::coupledLinearSystem
     rows_(),
     cols_(),
     vals_(),
-    rhs_(nLocalRows, 0.0)
+    rhs_(nLocalRows, 0.0),
+    rowOrder_(),
+    rowFirst_(),
+    groupedEntries_(-1),
+    colsByRow_(),
+    valsByRow_(),
+    valsStale_(true)
 {}
+
+
+void Foam::coupledLinearSystem::groupByRow() const
+{
+    if (groupedEntries_ == rows_.size())
+    {
+        return;
+    }
+    // Counting sort of the triplet indices by local row.
+    rowFirst_.setSize(nLocalRows_ + 1);
+    rowFirst_ = 0;
+    forAll(rows_, k)
+    {
+        rowFirst_[rows_[k] - rowStart_ + 1]++;
+    }
+    for (label i = 0; i < nLocalRows_; i++)
+    {
+        rowFirst_[i + 1] += rowFirst_[i];
+    }
+    rowOrder_.setSize(rows_.size());
+    List<label> fill(SubList<label>(rowFirst_, nLocalRows_));
+    forAll(rows_, k)
+    {
+        rowOrder_[fill[rows_[k] - rowStart_]++] = k;
+    }
+    groupedEntries_ = rows_.size();
+    colsByRow_.setSize(rows_.size());
+    forAll(rowOrder_, q)
+    {
+        colsByRow_[q] = cols_[rowOrder_[q]];
+    }
+    valsStale_ = true;
+}
+
+
+void Foam::coupledLinearSystem::gatherValues() const
+{
+    groupByRow();
+    if (!valsStale_)
+    {
+        return;
+    }
+    valsByRow_.setSize(vals_.size());
+    const label n = vals_.size();
+    #pragma omp parallel for schedule(static)
+    for (label q = 0; q < n; q++)
+    {
+        valsByRow_[q] = vals_[rowOrder_[q]];
+    }
+    valsStale_ = false;
+}
 
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
@@ -67,6 +126,7 @@ void Foam::coupledLinearSystem::clear()
     cols_.clear();
     vals_.clear();
     rhs_ = 0.0;
+    valsStale_ = true;
 }
 
 
@@ -89,16 +149,35 @@ void Foam::coupledLinearSystem::setRowIdentity
         return;
     }
 
-    forAll(rows_, k)
+    if (groupedEntries_ == rows_.size() + 1)
     {
-        if (rows_[k] == gRow)
+        // The pattern of the previous outer iteration, which ended with the
+        // identity entry this call is about to append: only this row's
+        // triplets, not a scan of all of them, skipping that last index.
+        const label i = gRow - rowStart_;
+        for (label q = rowFirst_[i]; q < rowFirst_[i + 1]; q++)
         {
-            vals_[k] = 0.0;
+            const label k = rowOrder_[q];
+            if (k < rows_.size())
+            {
+                vals_[k] = 0.0;
+            }
+        }
+    }
+    else
+    {
+        forAll(rows_, k)
+        {
+            if (rows_[k] == gRow)
+            {
+                vals_[k] = 0.0;
+            }
         }
     }
 
     add(gRow, gRow, 1.0);
     rhs_[gRow - rowStart_] = value;
+    valsStale_ = true;
 }
 
 
@@ -110,31 +189,34 @@ void Foam::coupledLinearSystem::multiply
 ) const
 {
     result.setSize(nLocalRows_);
-    result = 0.0;
+    groupByRow();
 
-    forAll(rows_, k)
+    // Off-rank columns must all have values; checked here, outside the
+    // parallel loop, where a fatal error cannot be raised.
+    forAll(cols_, k)
     {
         const label c = cols_[k];
-
-        scalar xv;
-
-        if (ownRow(c))
+        if (!ownRow(c) && !xRemote.found(c))
         {
-            xv = xLocal[c - rowStart_];
+            FatalErrorInFunction
+                << "No value available for off-rank column " << c
+                << exit(FatalError);
         }
-        else
+    }
+
+    gatherValues();
+    #pragma omp parallel for schedule(static)
+    for (label i = 0; i < nLocalRows_; i++)
+    {
+        scalar s = 0.0;
+        for (label q = rowFirst_[i]; q < rowFirst_[i + 1]; q++)
         {
-            if (!xRemote.found(c))
-            {
-                FatalErrorInFunction
-                    << "No value available for off-rank column " << c
-                    << exit(FatalError);
-            }
-
-            xv = xRemote[c];
+            const label c = colsByRow_[q];
+            const scalar xv =
+                ownRow(c) ? xLocal[c - rowStart_] : xRemote.find(c)();
+            s += valsByRow_[q]*xv;
         }
-
-        result[rows_[k] - rowStart_] += vals_[k]*xv;
+        result[i] = s;
     }
 }
 
@@ -146,12 +228,18 @@ void Foam::coupledLinearSystem::multiplyUniform
 ) const
 {
     result.setSize(nLocalRows_);
-    result = 0.0;
+    groupByRow();
 
-    forAll(rows_, k)
+    gatherValues();
+    #pragma omp parallel for schedule(static)
+    for (label i = 0; i < nLocalRows_; i++)
     {
-        result[rows_[k] - rowStart_] +=
-            vals_[k]*xRef[cols_[k] % blockSize_];
+        scalar s = 0.0;
+        for (label q = rowFirst_[i]; q < rowFirst_[i + 1]; q++)
+        {
+            s += valsByRow_[q]*xRef[colsByRow_[q] % blockSize_];
+        }
+        result[i] = s;
     }
 }
 
@@ -183,6 +271,20 @@ Foam::autoPtr<Foam::coupledSolver> Foam::coupledSolver::New
             << " without PETSc support." << nl
             << "Install petsc-dev (pkg-config PETSc) and rebuild, or select"
             << " a serial Eigen backend." << exit(FatalError);
+        return autoPtr<coupledSolver>(nullptr);
+        #endif
+    }
+
+    if (backend == "AmgX")
+    {
+        #ifdef HAVE_AMGX
+        return autoPtr<coupledSolver>(new amgxCoupledSolver(dict));
+        #else
+        FatalErrorInFunction
+            << "linearSolver AmgX requested but coupledSimpleFoam was built"
+            << " without AmgX support." << nl
+            << "Build NVIDIA AmgX, set AMGX_DIR to its install prefix and"
+            << " rebuild." << exit(FatalError);
         return autoPtr<coupledSolver>(nullptr);
         #endif
     }

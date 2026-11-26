@@ -104,6 +104,26 @@ class coupledLinearSystem
         //- Right-hand side, local rows only
         scalarField rhs_;
 
+        //- The triplets grouped by local row: rowOrder_[rowFirst_[i] ..
+        //  rowFirst_[i+1]) are the triplet indices of row i.  Built once by
+        //  groupByRow() and reused while the entry count is unchanged (the
+        //  sparsity pattern is static across outer iterations, which every
+        //  backend already relies on); it is what lets the products below
+        //  run in parallel without write conflicts.
+        mutable List<label> rowOrder_;
+        mutable List<label> rowFirst_;
+        mutable label groupedEntries_;
+
+        //- Columns and values in row order (rowOrder_), so the products read
+        //  contiguous memory.  Columns change only with the pattern; values
+        //  are gathered again after clear() or setRowIdentity().
+        mutable List<label> colsByRow_;
+        mutable List<scalar> valsByRow_;
+        mutable bool valsStale_;
+
+        void groupByRow() const;
+        void gatherValues() const;
+
 
 public:
 

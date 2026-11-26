@@ -8,6 +8,10 @@
 coupledLinearSystem.C
 eigenCoupledSolver.C
 petscCoupledSolver.C
+amgxCommon.C
+amgxCoupledSolver.C
+amgxLduSolver.C
+conjugateEnergy.C
 coupledSimpleFoam.C
 
 EXE = $(FOAM_USER_APPBIN)/coupledSimpleFoam

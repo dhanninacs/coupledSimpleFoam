@@ -62,19 +62,35 @@ endif
 #   libincompressibleMomentumTransportModels  laminar/RAS/LES incompressible
 #   libphysicalProperties                    viscosityModel (physicalProperties)
 #   libmeshTools                             syncTools, wedge/symmetry patches
+# NVIDIA AmgX (serial GPU backend, linearSolver AmgX): active only when AMGX_DIR names an AmgX
+# install prefix (include/amgx_c.h, lib/libamgxsh.so). Without it the backend compiles to nothing.
+AMGX_INC :=
+AMGX_LIB :=
+# The run-time path to libamgxsh.so; set AMGX_RPATH= (empty) for a Windows (MinGW) build,
+# where amgxsh.dll is found beside the executable.
+AMGX_RPATH ?= -Wl,-rpath,$(AMGX_DIR)/lib
+ifneq ($(strip $(AMGX_DIR)),)
+    AMGX_INC := -DHAVE_AMGX -I$(AMGX_DIR)/include
+    AMGX_LIB := -L$(AMGX_DIR)/lib -lamgxsh $(AMGX_RPATH)
+endif
+
 EXE_INC = \
+    -fopenmp \
     $(EIGEN_INC) \
     -I$(LIB_SRC)/MomentumTransportModels/momentumTransportModels/lnInclude \
     -I$(LIB_SRC)/MomentumTransportModels/incompressible/lnInclude \
     -I$(LIB_SRC)/physicalProperties/lnInclude \
     -I$(LIB_SRC)/finiteVolume/lnInclude \
     -I$(LIB_SRC)/meshTools/lnInclude \
-    $(PETSC_INC)
+    $(PETSC_INC) \
+    $(AMGX_INC)
 
 EXE_LIBS = \
+    -fopenmp \
     -lmomentumTransportModels \
     -lincompressibleMomentumTransportModels \
     -lphysicalProperties \
     -lfiniteVolume \
     -lmeshTools \
-    $(PETSC_LIB)
+    $(PETSC_LIB) \
+    $(AMGX_LIB)
