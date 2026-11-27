@@ -3,6 +3,7 @@
 \*---------------------------------------------------------------------------*/
 
 #include "conjugateEnergy.H"
+#include "cyclicFvPatch.H"
 
 #include <algorithm>
 #include <cmath>
@@ -21,6 +22,27 @@
 
 #ifdef HAVE_AMGX
 #include "amgxCommon.H"
+
+namespace
+{
+    // The cells across a coupled patch of a conjugate region: a conformal
+    // cyclic couples each face to its partner face on the other side, like an
+    // internal face. Other coupled types (cyclicAMI, non-conformal, processor)
+    // are refused rather than silently treated as adiabatic.
+    const Foam::labelUList& cyclicPartnerCells(const Foam::fvPatch& patch)
+    {
+        if (!Foam::isA<Foam::cyclicFvPatch>(patch))
+        {
+            FatalErrorInFunction
+                << "Conjugate energy: patch " << patch.name() << " of region "
+                << patch.boundaryMesh().mesh().name() << " is a coupled patch of type "
+                << patch.type() << ". The conjugate temperature system couples "
+                << "conformal cyclic patches only (and runs serially)."
+                << Foam::exit(Foam::FatalError);
+        }
+        return Foam::refCast<const Foam::cyclicFvPatch>(patch).nbrPatch().faceCells();
+    }
+}
 #endif
 
 namespace
@@ -288,6 +310,18 @@ void Foam::conjugateEnergy::buildPattern()
         {
             rows.push_back(off + u[f]); cols.push_back(off + l[f]);   // lower
         }
+        // Cyclic patches: each face's cell coupled to its partner's cell.
+        forAll(mesh.boundary(), pi)
+        {
+            const fvPatch& patch = mesh.boundary()[pi];
+            if (!patch.coupled()) continue;
+            const labelUList& fc = patch.faceCells();
+            const labelUList& nc = cyclicPartnerCells(patch);
+            forAll(fc, i)
+            {
+                rows.push_back(off + fc[i]); cols.push_back(off + nc[i]);
+            }
+        }
     };
     region(fluid_, 0);
     forAll(solids_, s)
@@ -370,17 +404,23 @@ void Foam::conjugateEnergy::assemble
         scalarField source(M.source());
         forAll(mesh.boundary(), pi)
         {
-            if (skip.found(pi) || mesh.boundary()[pi].coupled())
+            if (skip.found(pi))
             {
                 continue;
             }
             const labelUList& fc = mesh.boundary()[pi].faceCells();
             const scalarField& ic = M.internalCoeffs()[pi];
             const scalarField& bc = M.boundaryCoeffs()[pi];
+            // A coupled (cyclic) patch adds its internal coefficients to the
+            // diagonal as any patch does (fvMatrix::addBoundaryDiag); its
+            // boundary coefficients couple to the partner cells below
+            // (A[cell][partner] = -boundaryCoeffs, as lduMatrix::Amul applies
+            // them), instead of entering the source.
+            const bool coupled = mesh.boundary()[pi].coupled();
             forAll(fc, i)
             {
                 diag[fc[i]] += ic[i];
-                source[fc[i]] += bc[i];
+                if (!coupled) source[fc[i]] += bc[i];
             }
         }
         for (label i = 0; i < mesh.nCells(); i++)
@@ -392,6 +432,13 @@ void Foam::conjugateEnergy::assemble
         const scalarField& lower = M.hasLower() ? M.lower() : M.upper();
         forAll(upper, f) contrib.push_back(upper[f]);
         forAll(lower, f) contrib.push_back(lower[f]);
+        // Cyclic partner coefficients, in the order the pattern lists them.
+        forAll(mesh.boundary(), pi)
+        {
+            if (!mesh.boundary()[pi].coupled()) continue;
+            const scalarField& bc = M.boundaryCoeffs()[pi];
+            forAll(bc, i) contrib.push_back(-bc[i]);
+        }
     };
 
     // Fluid: the same equation as the segregated path, in W/K.

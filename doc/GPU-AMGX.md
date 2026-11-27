@@ -112,6 +112,9 @@ or those redistributable DLLs placed beside the executable.
 
 - One rank, one GPU. A parallel run uses PETSc.
 - Conjugate interfaces must be conformal (every face matched by centre).
+- Cyclic patches inside a region are coupled in the conjugate temperature system, as in the
+  p-U system (conformal cyclic only; cyclicAMI and other coupled types stop the run with an
+  error). Conjugate mode runs serially.
 - The conjugate energy is a passive scalar: constant properties, no buoyancy,
   no radiation, no volumetric sources yet.
 - `amgxReuse none` (keep the hierarchy untouched between rebuilds) does not
