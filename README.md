@@ -78,15 +78,23 @@ Nu = 7.54.
   `Prt`) and a `0/T` field. Passive scalar only — no buoyancy, constant
   properties — and validated against the exact Nu = 7.54 for isothermal
   parallel plates.
-- **Two linear-algebra backends.** Eigen `SparseLU` / `BiCGSTAB` for serial
-  runs, PETSc `MATMPIAIJ` + `KSP` for MPI. The backend is a runtime keyword, not
+- **NVIDIA GPU (AmgX).** `linearSolver AmgX` solves the whole coupled p-U
+  system as one 4x4 block matrix on one GPU with NVIDIA AmgX (BSD-3-Clause),
+  and `solver AmgX;` any scalar equation; 3-4x the PETSc backend on 10 CPU
+  cores on the 2.1M-cell ducts measured. See [`doc/GPU-AMGX.md`](doc/GPU-AMGX.md).
+- **Conjugate heat transfer.** `COUPLED/solidRegions` with `-region <fluid>`
+  solves the temperature of the fluid and every solid region of a
+  `splitMeshRegions` case as one system (cyclic patches included), on the GPU
+  (`conjugateSolver AmgX`) or the CPU (`conjugateSolver Eigen`), serially.
+- **Linear-algebra backends.** Eigen `SparseLU` / `BiCGSTAB` for serial
+  runs, PETSc `MATMPIAIJ` + `KSP` for MPI, AmgX for one NVIDIA GPU. The backend is a runtime keyword, not
   a build variant, and the parallel result reproduces the serial one to 1e-10 or
   better.
 - **Runtime-selectable preconditioners.** The whole PETSc options string is a
   dictionary entry. The `[u,v,w] / [p]` fieldsplit index sets come free from the
   block-4 interleaving, so Schur-complement preconditioning needs no code.
 - **Adaptive inner tolerance and preconditioner reuse.** `adaptiveTolerance`
-  sets the PETSc relative tolerance each outer iteration from the ratio of
+  sets the inner relative tolerance (PETSc, AmgX, Eigen BiCGSTAB) each outer iteration from the ratio of
   successive nonlinear block residuals (an Eisenstat-Walker forcing term,
   clamped between `relTolMin` and `relTolMax`); `pcReuseInterval` rebuilds the
   preconditioner every N outer iterations and reuses it in between. Both are
@@ -160,11 +168,13 @@ evidence and its acceptance criteria in [`doc/VALIDATION.md`](doc/VALIDATION.md)
 | Python | 3.8+ | optional | `tools/compare_fields.py` needs the standard library only; `tools/reference_prototype/` additionally needs NumPy and SciPy |
 
 Without PETSc the solver builds and runs serially against Eigen alone. MPI runs
-require PETSc. The sources are device agnostic, and an optional CUDA build layer
-for NVIDIA GPUs lives in a companion repository,
-[`coupledSimpleFoam-gpu`](https://github.com/dhanninacs/coupledSimpleFoam-gpu),
-where one GPU is worth roughly ten CPU cores on the reference machine and does
-not beat them.
+require PETSc. The GPU backend needs NVIDIA AmgX 2.5 built as `amgxsh` and
+`AMGX_DIR` set at build time (see [`doc/GPU-AMGX.md`](doc/GPU-AMGX.md)); without
+it the AmgX code compiles to nothing. On Windows, FoamWin
+(<https://github.com/dhanninacs/foamWin>) ships all three builds. The earlier
+CUDA-PETSc companion repository
+([`coupledSimpleFoam-gpu`](https://github.com/dhanninacs/coupledSimpleFoam-gpu))
+is superseded: one GPU there was worth roughly ten CPU cores.
 
 ## Quick start
 
@@ -285,6 +295,7 @@ selection procedure and the full limitation list are in
 | [`doc/THEORY.md`](doc/THEORY.md) | The coupled formulation: unknown ordering, the implicit pressure-gradient block, the Rhie-Chow continuity row, boundary-condition handling, residual normalisation |
 | [`doc/INSTALL.md`](doc/INSTALL.md) | Prerequisites, build switches, and the optional PETSc build |
 | [`doc/USAGE.md`](doc/USAGE.md) | The `COUPLED` dictionary key by key, preconditioner and tolerance guidance, and the full list of limitations |
+| [`doc/GPU-AMGX.md`](doc/GPU-AMGX.md) | The AmgX GPU backend, the conjugate mode, the measurements on GPU and CPU, building on Linux and FoamWin, limits |
 | [`doc/BENCHMARKS.md`](doc/BENCHMARKS.md) | Iteration counts and wall-clock measurements against segregated SIMPLE, MPI scaling, the preconditioner study, the four-point size sweep and the tuned large-case configuration |
 | [`doc/VALIDATION.md`](doc/VALIDATION.md) | Verification evidence: discrete continuity, agreement with segregated references, parallel-vs-serial reproduction, regression gates |
 | [`doc/DEVELOPMENT.md`](doc/DEVELOPMENT.md) | Code layout, the OpenFOAM 14 API notes the implementation depends on, and how to add a backend |
