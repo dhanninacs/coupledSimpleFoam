@@ -116,6 +116,7 @@ Description
 #include "syncTools.H"
 #include "OSspecific.H"
 #include "symmetryFvPatch.H"
+#include "cyclicFvPatch.H"
 #include "symmetryPlaneFvPatch.H"
 #include "wedgeFvPatch.H"
 #include "wallFvPatch.H"
@@ -1462,6 +1463,33 @@ int main(int argc, char *argv[])
         Info<< nl << "COUPLED did NOT converge within " << nOuterIterations
             << " outer iterations" << nl << endl;
         runTime.writeNow();
+    }
+
+    // Cyclic flux check: the face fluxes on the two sides of each cyclic pair
+    // must be equal and opposite, or mass (and, in a conjugate case, the heat
+    // it carries) is not conserved across the pair. Reported, not enforced.
+    forAll(mesh.boundary(), patchi)
+    {
+        const fvPatch& fvp = mesh.boundary()[patchi];
+        if (!isA<cyclicFvPatch>(fvp) || fvp.size() == 0) continue;
+        const cyclicFvPatch& cyc = refCast<const cyclicFvPatch>(fvp);
+        if (!cyc.owner()) continue;
+        const scalarField& a = phi.boundaryField()[patchi];
+        const scalarField& b = phi.boundaryField()[cyc.nbrPatchIndex()];
+        scalar maxMismatch = 0, maxFlux = 0, net = 0;
+        forAll(a, i)
+        {
+            maxMismatch = max(maxMismatch, mag(a[i] + b[i]));
+            maxFlux = max(maxFlux, mag(a[i]));
+            net += a[i];
+        }
+        reduce(maxMismatch, maxOp<scalar>());
+        reduce(maxFlux, maxOp<scalar>());
+        reduce(net, sumOp<scalar>());
+        Info<< "cyclic flux check: " << fvp.name() << " <-> "
+            << mesh.boundary()[cyc.nbrPatchIndex()].name()
+            << ": net flux " << net << ", max |phi + phi_nbr| = " << maxMismatch
+            << " (max |phi| " << maxFlux << ")" << endl;
     }
 
     Info<< "End\n" << endl;

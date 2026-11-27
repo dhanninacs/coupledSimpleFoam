@@ -52,6 +52,38 @@ solid regions with `kappa` in `constant/<solid>/physicalProperties`
 `<solid>_to_<fluid>` conformal and `fixedValue` (the solve sets them to the
 interface temperature). Run `coupledSimpleFoam -region fluid`.
 
+## AmgX for any OpenFOAM solver (transient runs, mesh changes)
+
+`src/amgxSolvers` builds the scalar AmgX solver as a library, `libamgxSolvers`
+(`./Allwmake` with `AMGX_DIR` set; FoamWin ships it in `bin/amgx`). Any solver can
+load it, for example `foamRun -solver incompressibleFluid` in a transient
+(PIMPLE) run:
+
+```c++
+// system/controlDict
+libs ("libamgxSolvers.so");      // ".so" also on Windows: FoamWin loads the .dll
+
+// system/fvSolution
+p      { solver AmgX; tolerance 1e-6; relTol 0.05; }
+pFinal { $p; relTol 0; }
+pcorr  { solver AmgX; tolerance 1e-2; relTol 0; }   // with a topology changer
+```
+
+- The solver of each field is kept between solves: the AMG hierarchy is
+  refreshed on the new coefficients (`resetup`) and rebuilt in full every
+  `amgxSetupInterval` solves (default 10).
+- A topology change (`fvMeshTopoChangers` refiner, mesh-to-mesh mapping)
+  rebuilds the field's pattern and GPU handles. A 3D lid-driven cavity
+  refined and unrefined five times solved its pressure and `pcorr` on AmgX
+  throughout, through the same mesh changes as the GAMG run.
+- Serial only, and no cyclic or processor interfaces (stopped with an error).
+- **Use it on large meshes.** Every GPU solve carries a fixed latency of many
+  small kernel launches and synchronisations. On the Re 100 cylinder tutorial
+  (5,388 cells), AmgX pressure gives the same drag as PCG (Cd to 1e-4 before
+  shedding starts) but runs about 9x slower than PCG on one core. On a mesh that
+  small the GPU has nothing to hide its latency behind; it pays off at hundreds of
+  thousands of cells and up, as for the coupled solver.
+
 ## Measured (2026-11-27)
 
 One NVIDIA RTX 4000 Ada (20 GB, 1/64-rate FP64) against an Intel i9-13900
@@ -111,6 +143,8 @@ or those redistributable DLLs placed beside the executable.
 ## Limits
 
 - One rank, one GPU. A parallel run uses PETSc.
+- After a run, `cyclic flux check` lines report, per cyclic pair, the net flux and the largest
+  |phi + phi_nbr|; it must be round-off, or mass (and heat) leaks across the pair.
 - Conjugate interfaces must be conformal (every face matched by centre).
 - Cyclic patches inside a region are coupled in the conjugate temperature system, as in the
   p-U system (conformal cyclic only; cyclicAMI and other coupled types stop the run with an

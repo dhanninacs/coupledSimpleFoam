@@ -1,0 +1,4 @@
+../coupledSimpleFoam/amgxCommon.C
+../coupledSimpleFoam/amgxLduSolver.C
+
+LIB = $(FOAM_USER_LIBBIN)/libamgxSolvers

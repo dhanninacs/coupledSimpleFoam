@@ -1,0 +1,5 @@
+AMGX_RPATH ?= -Wl,-rpath,$(AMGX_DIR)/lib
+
+EXE_INC =     -DHAVE_AMGX     -I$(AMGX_DIR)/include     -I../coupledSimpleFoam
+
+LIB_LIBS =     -L$(AMGX_DIR)/lib -lamgxsh $(AMGX_RPATH)     -lOpenFOAM

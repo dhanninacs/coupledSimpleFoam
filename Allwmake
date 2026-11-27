@@ -84,4 +84,11 @@ else
     exit 1
 fi
 
+# The AmgX lduMatrix solver as a library for any OpenFOAM solver (foamRun's
+# transient pressure solve, for example): only with an AmgX install.
+if [ -n "$AMGX_DIR" ]; then
+    wmake "$@" libso src/amgxSolvers || exit $?
+    echo "Built $FOAM_USER_LIBBIN/libamgxSolvers.so (libs (\"libamgxSolvers.so\"); solver AmgX;)"
+fi
+
 #------------------------------------------------------------------------------

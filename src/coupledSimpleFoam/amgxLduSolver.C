@@ -14,6 +14,8 @@
 #include "amgxCommon.H"
 #include "addToRunTimeSelectionTable.H"
 #include "regIOobject.H"
+#include <map>
+#include <cmath>
 #include "objectRegistry.H"
 #include "Time.H"
 
@@ -63,6 +65,10 @@ public:
     TypeName("amgxFieldState");
 
     int n = 0;
+    int nFaces = 0;
+    //- The addressing the pattern was built from: a topology change (a
+    //  refiner, a mesh-to-mesh map) gives the matrix new addressing.
+    const void* addressing = nullptr;
     int nnz = 0;
     std::vector<int> rowPtr;
     std::vector<int> colIdx;
@@ -77,6 +83,18 @@ public:
     AMGX_vector_handle x = nullptr;
     bool uploaded = false;
 
+    //- Solvers kept between solves, one per inner-tolerance decade (the
+    //  tolerance lives in the AmgX config): built once, then refreshed with
+    //  resetup on the new coefficients, and rebuilt in full every
+    //  setupInterval solves.
+    struct keptSolver
+    {
+        AMGX_config_handle cfg = nullptr;
+        AMGX_solver_handle slv = nullptr;
+        int sinceSetup = 0;
+    };
+    std::map<int, keptSolver> solvers;
+
     amgxFieldState
     (
         const IOobject& io,
@@ -86,6 +104,11 @@ public:
 
     virtual ~amgxFieldState()
     {
+        for (auto& kv : solvers)
+        {
+            if (kv.second.slv) AMGX_solver_destroy(kv.second.slv);
+            if (kv.second.cfg) AMGX_config_destroy(kv.second.cfg);
+        }
         if (x) AMGX_vector_destroy(x);
         if (b) AMGX_vector_destroy(b);
         if (A) AMGX_matrix_destroy(A);
@@ -118,7 +141,8 @@ Foam::amgxFieldState::amgxFieldState
     n = static_cast<int>(addr.size());
     const labelUList& l = addr.lowerAddr();
     const labelUList& u = addr.upperAddr();
-    const int nFaces = static_cast<int>(l.size());
+    nFaces = static_cast<int>(l.size());
+    addressing = static_cast<const void*>(&addr);
 
     std::vector<int> count(n, 1);  // the diagonal
     for (int f = 0; f < nFaces; f++)
@@ -204,12 +228,26 @@ namespace
         }
         Foam::amgxFieldState& s =
             db.lookupObjectRef<Foam::amgxFieldState>(name);
-        if (s.n != static_cast<int>(m.lduAddr().size()))
+        const Foam::lduAddressing& addr = m.lduAddr();
+        if
+        (
+            s.n != static_cast<int>(addr.size())
+         || s.nFaces != static_cast<int>(addr.lowerAddr().size())
+         || s.addressing != static_cast<const void*>(&addr)
+        )
         {
-            FatalErrorInFunction
-                << "the mesh of field " << field << " changed size; solver"
-                << " AmgX does not handle topology changes"
-                << Foam::exit(Foam::FatalError);
+            // The mesh changed topology (a refiner, mesh-to-mesh mapping):
+            // drop the old pattern and GPU handles and build them anew for
+            // the new addressing. The registry owns the state, so checking
+            // it out deletes it.
+            if (Foam::lduMatrix::debug)
+            {
+                Foam::Info<< "AmgX: rebuilding the matrix of " << field
+                    << " for a changed mesh (" << s.n << " -> "
+                    << addr.size() << " cells)" << Foam::endl;
+            }
+            s.checkOut();
+            return stateFor(field, m, config);
         }
         return s;
     }
@@ -342,32 +380,50 @@ Foam::solverPerformance Foam::amgxLduSolver::solve
         AMGX_vector_upload(s.b, s.n, 1, source.cdata()), "vector_upload rhs"
     );
 
+    const label setupInterval =
+        max(label(1), controlDict_.lookupOrDefault<label>("amgxSetupInterval", 10));
+
     label totalIts = 0;
     for (int pass = 0; pass < 4; pass++)
     {
-        std::ostringstream full;
-        full.precision(6);
-        full << config << ", main:tolerance=" << amgxTol
-             << ", main:max_iters=" << max(maxIter_ - totalIts, label(1));
-        AMGX_config_handle cfg;
-        amgxCommon::check(AMGX_config_create(&cfg, full.str().c_str()), "config_create");
-        AMGX_solver_handle slv;
-        amgxCommon::check
-        (
-            AMGX_solver_create(&slv, s.rsrc, AMGX_mode_dDDI, cfg), "solver_create"
-        );
-        amgxCommon::check(AMGX_solver_setup(slv, s.A), "solver_setup");
+        // The tolerance rounded down to a decade (never looser than asked),
+        // so that the solver built for it serves the next solves too.
+        const int decade =
+            static_cast<int>(std::floor(std::log10(max(amgxTol, scalar(1e-14)))));
+        amgxFieldState::keptSolver& k = s.solvers[decade];
+        if (!k.slv)
+        {
+            std::ostringstream full;
+            full.precision(6);
+            full << config << ", main:tolerance=" << std::pow(10.0, decade)
+                 << ", main:max_iters=" << max(maxIter_, label(1));
+            amgxCommon::check(AMGX_config_create(&k.cfg, full.str().c_str()), "config_create");
+            amgxCommon::check
+            (
+                AMGX_solver_create(&k.slv, s.rsrc, AMGX_mode_dDDI, k.cfg), "solver_create"
+            );
+            amgxCommon::check(AMGX_solver_setup(k.slv, s.A), "solver_setup");
+            k.sinceSetup = 0;
+        }
+        else if (++k.sinceSetup >= setupInterval)
+        {
+            amgxCommon::check(AMGX_solver_setup(k.slv, s.A), "solver_setup");
+            k.sinceSetup = 0;
+        }
+        else
+        {
+            // Same pattern, new coefficients: keep the hierarchy's structure.
+            amgxCommon::check(AMGX_solver_resetup(k.slv, s.A), "solver_resetup");
+        }
         amgxCommon::check
         (
             AMGX_vector_upload(s.x, s.n, 1, psi.cdata()), "vector_upload x"
         );
-        amgxCommon::check(AMGX_solver_solve(slv, s.b, s.x), "solver_solve");
+        amgxCommon::check(AMGX_solver_solve(k.slv, s.b, s.x), "solver_solve");
         int its = 0;
-        AMGX_solver_get_iterations_number(slv, &its);
+        AMGX_solver_get_iterations_number(k.slv, &its);
         totalIts += its;
         amgxCommon::check(AMGX_vector_download(s.x, psi.data()), "vector_download");
-        AMGX_solver_destroy(slv);
-        AMGX_config_destroy(cfg);
 
         matrix_.Amul(yA, psi, interfaceBouCoeffs_, interfaces_, cmpt);
         rA = source - yA;
