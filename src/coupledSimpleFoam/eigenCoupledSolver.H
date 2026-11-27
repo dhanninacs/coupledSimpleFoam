@@ -35,6 +35,13 @@ Description
     linearSolver SparseLU   sparse direct LU with COLAMD ordering (default)
     linearSolver BiCGSTAB   BiCGSTAB preconditioned with IncompleteLUT
 
+    The BiCGSTAB path works on a row-major matrix, so Eigen runs its
+    matrix-vector products on all OpenMP threads; keeps its IncompleteLUT
+    between outer iterations and rebuilds it every pcReuseInterval solves
+    (default 1: every solve); and takes the adaptive inner tolerance
+    (adaptiveTolerance, Eisenstat-Walker) through setRelTol, as the PETSc and
+    AmgX backends do.
+
 SourceFiles
     eigenCoupledSolver.C
 
@@ -70,6 +77,13 @@ class eigenCoupledSolver
         //- Opaque handle to the Eigen SparseLU object
         void* luPtr_;
 
+        //- BiCGSTAB: the kept IncompleteLUT (opaque), how often it is
+        //  rebuilt, how many solves since, and the adaptive tolerance
+        void* ilutPtr_;
+        label pcReuseInterval_;
+        label solvesSinceBuild_;
+        scalar relTol_;
+
 
 public:
 
@@ -83,6 +97,12 @@ public:
     }
 
     virtual label solve(const coupledLinearSystem& sys, scalarField& x);
+
+    //- The inner tolerance of the next BiCGSTAB solve (adaptiveTolerance)
+    virtual void setRelTol(const scalar rtol)
+    {
+        relTol_ = rtol;
+    }
 };
 
 

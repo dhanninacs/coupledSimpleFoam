@@ -46,6 +46,41 @@ Description
 typedef Eigen::SparseMatrix<double, Eigen::ColMajor, int> coupledSpMat;
 typedef Eigen::SparseLU<coupledSpMat, Eigen::COLAMDOrdering<int>> coupledLU;
 typedef Eigen::Triplet<double, int> coupledTriplet;
+// Row-major for BiCGSTAB: Eigen multi-threads sparse matrix-vector products
+// (OpenMP) for row-major matrices only.
+typedef Eigen::SparseMatrix<double, Eigen::RowMajor, int> coupledRowMat;
+typedef Eigen::IncompleteLUT<double, int> coupledILUT;
+
+namespace
+{
+    // A preconditioner for Eigen::BiCGSTAB that applies an IncompleteLUT
+    // built elsewhere and kept between solves: Eigen's own compute() would
+    // rebuild it for every matrix, which cost most of each outer iteration.
+    class keptILUT
+    {
+    public:
+        typedef double Scalar;
+        typedef double RealScalar;
+        typedef int StorageIndex;
+        enum { ColsAtCompileTime = Eigen::Dynamic, MaxColsAtCompileTime = Eigen::Dynamic };
+
+        keptILUT() : ilut_(nullptr) {}
+        template<typename M> keptILUT(const M&) : ilut_(nullptr) {}
+        void set(const coupledILUT* ilut) { ilut_ = ilut; }
+        template<typename M> keptILUT& analyzePattern(const M&) { return *this; }
+        template<typename M> keptILUT& factorize(const M&) { return *this; }
+        template<typename M> keptILUT& compute(const M&) { return *this; }
+        template<typename Rhs> Eigen::VectorXd solve(const Rhs& b) const
+        {
+            Eigen::VectorXd x = ilut_->solve(b);
+            return x;
+        }
+        Eigen::ComputationInfo info() const { return Eigen::Success; }
+
+    private:
+        const coupledILUT* ilut_;
+    };
+}
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -58,11 +93,21 @@ Foam::eigenCoupledSolver::eigenCoupledSolver
     name_(backend == "BiCGSTAB" ? "EigenBiCGSTAB" : "EigenSparseLU"),
     tolerance_(dict.lookupOrDefault<scalar>("tolerance", 1e-10)),
     maxIter_(dict.lookupOrDefault<label>("maxLinearIter", 2000)),
-    dropTolerance_(dict.lookupOrDefault<scalar>("dropTolerance", 1e-5)),
-    fillFactor_(dict.lookupOrDefault<label>("fillFactor", 20)),
+    dropTolerance_(dict.lookupOrDefault<scalar>("dropTolerance", 1e-4)),
+    fillFactor_(dict.lookupOrDefault<label>("fillFactor", 5)),
     patternAnalysed_(false),
-    luPtr_(nullptr)
+    luPtr_(nullptr),
+    ilutPtr_(nullptr),
+    pcReuseInterval_(dict.lookupOrDefault<label>("pcReuseInterval", 1)),
+    solvesSinceBuild_(0),
+    relTol_(-1)
 {
+    if (pcReuseInterval_ < 1)
+    {
+        FatalErrorInFunction
+            << "pcReuseInterval must be >= 1, not " << pcReuseInterval_
+            << exit(FatalError);
+    }
     if (backend != "SparseLU" && backend != "BiCGSTAB")
     {
         FatalErrorInFunction
@@ -84,6 +129,11 @@ Foam::eigenCoupledSolver::~eigenCoupledSolver()
     {
         delete static_cast<coupledLU*>(luPtr_);
         luPtr_ = nullptr;
+    }
+    if (ilutPtr_)
+    {
+        delete static_cast<coupledILUT*>(ilutPtr_);
+        ilutPtr_ = nullptr;
     }
 }
 
@@ -169,25 +219,57 @@ Foam::label Foam::eigenCoupledSolver::solve
     }
     else
     {
-        Eigen::BiCGSTAB<coupledSpMat, Eigen::IncompleteLUT<double>> bicg;
-        bicg.preconditioner().setDroptol(dropTolerance_);
-        bicg.preconditioner().setFillfactor(static_cast<int>(fillFactor_));
-        bicg.setTolerance(tolerance_);
-        bicg.setMaxIterations(static_cast<int>(maxIter_));
-        bicg.compute(A);
+        coupledRowMat Ar(A);
+        Ar.makeCompressed();
 
-        if (bicg.info() != Eigen::Success)
+        // Rebuild the IncompleteLUT on the first solve and every
+        // pcReuseInterval solves; in between the kept one preconditions
+        // the new matrix.
+        if (!ilutPtr_ || solvesSinceBuild_ >= pcReuseInterval_)
         {
-            FatalErrorInFunction
-                << "Eigen IncompleteLUT preconditioner setup failed"
-                << exit(FatalError);
+            coupledILUT* ilut = static_cast<coupledILUT*>(ilutPtr_);
+            if (!ilut)
+            {
+                ilut = new coupledILUT();
+                ilutPtr_ = static_cast<void*>(ilut);
+            }
+            ilut->setDroptol(dropTolerance_);
+            ilut->setFillfactor(static_cast<int>(fillFactor_));
+            ilut->compute(Ar);
+            if (ilut->info() != Eigen::Success)
+            {
+                FatalErrorInFunction
+                    << "Eigen IncompleteLUT preconditioner setup failed"
+                    << exit(FatalError);
+            }
+            solvesSinceBuild_ = 0;
         }
+        solvesSinceBuild_++;
 
         Eigen::VectorXd x0(n);
         for (int i = 0; i < n; i++)
         {
             x0(i) = x[i];
         }
+
+        Eigen::BiCGSTAB<coupledRowMat, keptILUT> bicg;
+        bicg.preconditioner().set(static_cast<const coupledILUT*>(ilutPtr_));
+        // Eigen stops at ||r|| <= tol*||b||. The adaptive (Eisenstat-Walker)
+        // tolerance is relative to this solve's initial residual
+        // ||b - A x0||, as on the PETSc path: measured against ||b|| a good
+        // initial guess would make a loose tolerance accept no update at all
+        // and the outer loop would plateau.
+        scalar tol = tolerance_;
+        if (relTol_ > 0)
+        {
+            const scalar bNorm = b.norm();
+            const scalar r0Norm = (b - Ar*x0).norm();
+            tol = bNorm > 0 ? relTol_*r0Norm/bNorm : relTol_;
+            tol = max(tol, scalar(1e-14));
+        }
+        bicg.setTolerance(tol);
+        bicg.setMaxIterations(static_cast<int>(maxIter_));
+        bicg.compute(Ar);
 
         sol = bicg.solveWithGuess(b, x0);
 
