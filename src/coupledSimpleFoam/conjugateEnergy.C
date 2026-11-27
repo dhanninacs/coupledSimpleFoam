@@ -20,9 +20,6 @@
 #include <Eigen/Sparse>
 #include <Eigen/IterativeLinearSolvers>
 
-#ifdef HAVE_AMGX
-#include "amgxCommon.H"
-
 namespace
 {
     // The cells across a coupled patch of a conjugate region: a conformal
@@ -43,6 +40,10 @@ namespace
         return Foam::refCast<const Foam::cyclicFvPatch>(patch).nbrPatch().faceCells();
     }
 }
+
+#ifdef HAVE_AMGX
+#include "amgxCommon.H"
+
 #endif
 
 namespace
