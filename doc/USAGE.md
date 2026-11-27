@@ -496,6 +496,7 @@ backend**; only the active backend reads them.
 | `Pr` | `scalar` | `0.71` | Laminar Prandtl number, used as `alphaEff = nu/Pr + nut/Prt`. Only read when `solveEnergy` is on. Must be positive. Air is 0.71, water at 20 C about 7. It lives here rather than in `constant/physicalProperties` because for a passive scalar it is a coefficient of the transport equation, not a property the viscosity model knows about - the same choice OpenFOAM's own `scalarTransport` function object makes with its `alphal`. |
 | `Prt` | `scalar` | `0.85` | Turbulent Prandtl number. Only read when `solveEnergy` is on, and only has an effect when a RAS model makes `nut` non-zero. Must be positive. |
 | `residualControl` | `dictionary` | see below | Convergence thresholds. |
+| `residualFloor` | `scalar` | `1e-3` | Floor on each velocity component's residual normalisation, as a fraction of the largest velocity component's. A component that carries next to none of the flow (the cross-stream velocity of a periodic or symmetric case) otherwise has a normalisation made of round-off, so its residual stays O(1) and `residualControl` never fires although the flow has converged. `0` restores plain OpenFOAM normalisation. |
 
 ### 2.3 `residualControl`
 

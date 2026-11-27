@@ -470,6 +470,14 @@ int main(int argc, char *argv[])
         }
     };
 
+    // A velocity component that carries next to none of the flow (the cross-stream
+    // component of a periodic or symmetric case) has a normalisation factor made of
+    // round-off, so its OpenFOAM-normalised residual stays O(1) and residualControl
+    // never fires although the flow is converged. Each velocity component's factor is
+    // floored at residualFloor times the largest velocity component's factor.
+    const scalar residualFloor =
+        coupledDict.lookupOrDefault<scalar>("residualFloor", 1e-3);
+
     // OpenFOAM-style normalised residual, per block component
     auto blockResiduals = [&](const scalarField& xv, FixedList<scalar, 4>& res)
     {
@@ -507,7 +515,12 @@ int main(int argc, char *argv[])
         {
             reduce(num[c], sumOp<scalar>());
             reduce(den[c], sumOp<scalar>());
-            res[c] = num[c]/max(den[c], vSmall);
+        }
+        const scalar denU = max(max(den[0], den[1]), den[2]);
+        for (label c = 0; c < blockSize; c++)
+        {
+            const scalar d = c < 3 ? max(den[c], residualFloor*denU) : den[c];
+            res[c] = num[c]/max(d, vSmall);
         }
     };
 
