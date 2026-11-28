@@ -81,7 +81,8 @@ Nu = 7.54.
 - **NVIDIA GPU (AmgX).** `linearSolver AmgX` solves the whole coupled p-U
   system as one 4x4 block matrix on one GPU with NVIDIA AmgX (BSD-3-Clause),
   and `solver AmgX;` any scalar equation; 3-4x the PETSc backend on 10 CPU
-  cores on the 2.1M-cell ducts measured. See [`doc/GPU-AMGX.md`](doc/GPU-AMGX.md).
+  cores on the 2.1M-cell ducts measured. `amgxSmoother GS|DILU` picks the AMG smoother and
+  `amgxConfig` takes a whole AmgX configuration. See [`doc/GPU-AMGX.md`](doc/GPU-AMGX.md).
 - **Conjugate heat transfer.** `COUPLED/solidRegions` with `-region <fluid>`
   solves the temperature of the fluid and every solid region of a
   `splitMeshRegions` case as one system (cyclic patches included), on the GPU

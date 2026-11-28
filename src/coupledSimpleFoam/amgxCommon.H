@@ -19,6 +19,9 @@ Description
 #ifdef HAVE_AMGX
 
 #include <amgx_c.h>
+#include <string>
+#include "word.H"
+#include "label.H"
 
 namespace Foam
 {
@@ -43,6 +46,16 @@ namespace amgxCommon
 
     //- Fatal error when an AmgX call failed
     void check(AMGX_RC rc, const char* what);
+
+    //- The AMG smoother part of the built-in configurations, by name:
+    //  "DILU" (multicolour DILU, one pre/post sweep) or "GS" (multicolour
+    //  Gauss-Seidel, relaxation 0.9, two pre/post sweeps: robust on
+    //  stretched, high-aspect-ratio meshes, FoamWin #4). Anything else is
+    //  a fatal error naming the choices.
+    std::string smootherConfig(const word& smoother);
+
+    //- Fatal error, with what to try, when a solution came back non-finite
+    void checkFinite(const double* x, label n, const char* what);
 }
 }
 

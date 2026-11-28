@@ -72,6 +72,8 @@ class conjugateEnergy
     const word solverName_;
     const scalar tolerance_;
     const label maxIter_;
+    //- AmgX AMG smoother of the conjugate solve (DILU | GS)
+    const word smoother_;
 
     PtrList<fvMesh> solids_;
     PtrList<volScalarField> Ts_;

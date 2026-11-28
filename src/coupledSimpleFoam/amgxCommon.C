@@ -7,6 +7,7 @@
 #ifdef HAVE_AMGX
 
 #include <string>
+#include <cmath>
 
 #include "IOstreams.H"
 #include "error.H"
@@ -77,6 +78,43 @@ void Foam::amgxCommon::check(AMGX_RC rc, const char* what)
         AMGX_get_error_string(rc, buf, sizeof(buf));
         FatalErrorInFunction
             << "AmgX " << what << " failed: " << buf << exit(FatalError);
+    }
+}
+
+std::string Foam::amgxCommon::smootherConfig(const word& smoother)
+{
+    if (smoother == "DILU")
+    {
+        return
+            "amg:smoother(sm)=MULTICOLOR_DILU, sm:relaxation_factor=1.0, "
+            "amg:presweeps=1, amg:postsweeps=1";
+    }
+    if (smoother == "GS")
+    {
+        return
+            "amg:smoother(sm)=MULTICOLOR_GS, sm:relaxation_factor=0.9, "
+            "amg:presweeps=2, amg:postsweeps=2";
+    }
+    FatalErrorInFunction
+        << "amgxSmoother " << smoother << " is not one of DILU, GS"
+        << exit(FatalError);
+    return std::string();
+}
+
+
+void Foam::amgxCommon::checkFinite(const double* x, label n, const char* what)
+{
+    for (label i = 0; i < n; i++)
+    {
+        if (!std::isfinite(x[i]))
+        {
+            FatalErrorInFunction
+                << "AmgX returned a non-finite solution for " << what
+                << " (entry " << i << " of " << n << "): the linear solve"
+                << " diverged. On stretched or high-aspect-ratio meshes try"
+                << " amgxSmoother GS; else a smaller pseudoCo, or another"
+                << " amgxConfig." << exit(FatalError);
+        }
     }
 }
 

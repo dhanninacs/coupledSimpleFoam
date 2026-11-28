@@ -40,8 +40,7 @@ namespace
         "main:monitor_residual=1, main:print_solve_stats=0, "
         "main:preconditioner(amg)=AMG, "
         "amg:algorithm=AGGREGATION, amg:selector=SIZE_2, "
-        "amg:smoother(sm)=MULTICOLOR_DILU, sm:relaxation_factor=1.0, "
-        "amg:presweeps=1, amg:postsweeps=1, amg:max_iters=1, "
+        "@SMOOTHER@, amg:max_iters=1, "
         "amg:cycle=V, amg:max_levels=50, "
         "amg:coarse_solver=DENSE_LU_SOLVER, amg:dense_lu_num_rows=64, "
         "amg:min_coarse_rows=32";
@@ -76,12 +75,17 @@ public:
     std::vector<int> upperPos;   // entry (l[f], u[f])
     std::vector<int> lowerPos;   // entry (u[f], l[f])
     std::vector<double> values;
+    //- The values in single precision, for the mixed (dDFI) mode, whose
+    //  matrix AmgX takes as float
+    std::vector<float> valuesF;
     AMGX_config_handle rsrcCfg = nullptr;
     AMGX_resources_handle rsrc = nullptr;
     AMGX_matrix_handle A = nullptr;
     AMGX_vector_handle b = nullptr;
     AMGX_vector_handle x = nullptr;
     bool uploaded = false;
+    //- dDDI (double) or dDFI (mixed: single-precision matrix and AMG)
+    AMGX_Mode mode = AMGX_mode_dDDI;
 
     //- Solvers kept between solves, one per inner-tolerance decade (the
     //  tolerance lives in the AmgX config): built once, then refreshed with
@@ -99,7 +103,8 @@ public:
     (
         const IOobject& io,
         const lduMatrix& m,
-        const std::string& config
+        const std::string& config,
+        const bool mixed
     );
 
     virtual ~amgxFieldState()
@@ -130,11 +135,13 @@ Foam::amgxFieldState::amgxFieldState
 (
     const IOobject& io,
     const lduMatrix& m,
-    const std::string& config
+    const std::string& config,
+    const bool mixed
 )
 :
     regIOobject(io)
 {
+    mode = mixed ? AMGX_mode_dDFI : AMGX_mode_dDDI;
     amgxCommon::acquire();
 
     const lduAddressing& addr = m.lduAddr();
@@ -191,9 +198,9 @@ Foam::amgxFieldState::amgxFieldState
     values.assign(nnz, 0.0);
 
     rsrc = amgxCommon::resources();
-    amgxCommon::check(AMGX_matrix_create(&A, rsrc, AMGX_mode_dDDI), "matrix_create");
-    amgxCommon::check(AMGX_vector_create(&b, rsrc, AMGX_mode_dDDI), "vector_create");
-    amgxCommon::check(AMGX_vector_create(&x, rsrc, AMGX_mode_dDDI), "vector_create");
+    amgxCommon::check(AMGX_matrix_create(&A, rsrc, mode), "matrix_create");
+    amgxCommon::check(AMGX_vector_create(&b, rsrc, mode), "vector_create");
+    amgxCommon::check(AMGX_vector_create(&x, rsrc, mode), "vector_create");
 }
 
 
@@ -204,7 +211,8 @@ namespace
     (
         const Foam::word& field,
         const Foam::lduMatrix& m,
-        const std::string& config
+        const std::string& config,
+        const bool mixed
     )
     {
         const Foam::objectRegistry& db = m.mesh().db();
@@ -222,7 +230,8 @@ namespace
                     Foam::IOobject::NO_WRITE
                 ),
                 m,
-                config
+                config,
+                mixed
             );
             s->store();
         }
@@ -234,6 +243,7 @@ namespace
             s.n != static_cast<int>(addr.size())
          || s.nFaces != static_cast<int>(addr.lowerAddr().size())
          || s.addressing != static_cast<const void*>(&addr)
+         || s.mode != (mixed ? AMGX_mode_dDFI : AMGX_mode_dDDI)
         )
         {
             // The mesh changed topology (a refiner, mesh-to-mesh mapping):
@@ -247,7 +257,7 @@ namespace
                     << addr.size() << " cells)" << Foam::endl;
             }
             s.checkOut();
-            return stateFor(field, m, config);
+            return stateFor(field, m, config, mixed);
         }
         return s;
     }
@@ -320,10 +330,29 @@ Foam::solverPerformance Foam::amgxLduSolver::solve
     (
         controlDict_.lookupOrDefault<string>
         (
-            "amgxConfig", string(defaultScalarConfig)
+            "amgxConfig",
+            string
+            (
+                std::string(defaultScalarConfig).replace
+                (
+                    std::string(defaultScalarConfig).find("@SMOOTHER@"), 10,
+                    amgxCommon::smootherConfig(controlDict_.lookupOrDefault<word>("amgxSmoother", "GS"))
+                )
+            )
         )
     );
-    amgxFieldState& s = stateFor(fieldName_, matrix_, config);
+    const bool mixed =
+        controlDict_.lookupOrDefault<word>("amgxPrecision", "double") == "mixed";
+    if (mixed)
+    {
+        FatalErrorInFunction
+            << "amgxPrecision mixed is not available: with AmgX 2.5 the mixed (dDFI) "
+                << "mode fails inside AmgX (a floating-point exception in its convergence "
+                << "check, or \"Configuration feature is not implemented\") on the cases "
+                << "tested. Use amgxPrecision double (the default)."
+            << exit(FatalError);
+    }
+    amgxFieldState& s = stateFor(fieldName_, matrix_, config, mixed);
 
     // Coefficients into the cached CSR positions.
     const scalarField& diag = matrix_.diag();
@@ -342,6 +371,17 @@ Foam::solverPerformance Foam::amgxLduSolver::solve
         }
     }
 
+    const void* vals = s.values.data();
+    if (s.mode == AMGX_mode_dDFI)
+    {
+        s.valuesF.resize(s.values.size());
+        for (size_t i = 0; i < s.values.size(); i++)
+        {
+            s.valuesF[i] = static_cast<float>(s.values[i]);
+        }
+        vals = s.valuesF.data();
+    }
+
     if (!s.uploaded)
     {
         amgxCommon::check
@@ -349,7 +389,7 @@ Foam::solverPerformance Foam::amgxLduSolver::solve
             AMGX_matrix_upload_all
             (
                 s.A, s.n, s.nnz, 1, 1,
-                s.rowPtr.data(), s.colIdx.data(), s.values.data(), nullptr
+                s.rowPtr.data(), s.colIdx.data(), vals, nullptr
             ),
             "matrix_upload_all"
         );
@@ -361,7 +401,7 @@ Foam::solverPerformance Foam::amgxLduSolver::solve
         (
             AMGX_matrix_replace_coefficients
             (
-                s.A, s.n, s.nnz, s.values.data(), nullptr
+                s.A, s.n, s.nnz, vals, nullptr
             ),
             "matrix_replace_coefficients"
         );
@@ -400,7 +440,7 @@ Foam::solverPerformance Foam::amgxLduSolver::solve
             amgxCommon::check(AMGX_config_create(&k.cfg, full.str().c_str()), "config_create");
             amgxCommon::check
             (
-                AMGX_solver_create(&k.slv, s.rsrc, AMGX_mode_dDDI, k.cfg), "solver_create"
+                AMGX_solver_create(&k.slv, s.rsrc, s.mode, k.cfg), "solver_create"
             );
             amgxCommon::check(AMGX_solver_setup(k.slv, s.A), "solver_setup");
             k.sinceSetup = 0;
@@ -424,6 +464,7 @@ Foam::solverPerformance Foam::amgxLduSolver::solve
         AMGX_solver_get_iterations_number(k.slv, &its);
         totalIts += its;
         amgxCommon::check(AMGX_vector_download(s.x, psi.data()), "vector_download");
+        amgxCommon::checkFinite(psi.cdata(), psi.size(), fieldName_.c_str());
 
         matrix_.Amul(yA, psi, interfaceBouCoeffs_, interfaces_, cmpt);
         rA = source - yA;

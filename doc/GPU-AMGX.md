@@ -26,7 +26,8 @@ over rows of a triplet grouping built once (the pattern is static).
 COUPLED
 {
     linearSolver     AmgX;      // the coupled p-U system on the GPU
-    amgxPrecision    double;    // or mixed: single-precision matrix and AMG
+    amgxSmoother     GS;        // AMG smoother: GS (default) or DILU
+    // amgxPrecision mixed is refused: AmgX 2.5's mixed mode fails here
     pcReuseInterval  8;         // rebuild the AMG hierarchy every 8 solves
     amgxReuse        resetup;   // refresh its values in between (default)
     // amgxConfig    "...";     // a full AmgX config; outer scope "main"
@@ -83,6 +84,34 @@ pcorr  { solver AmgX; tolerance 1e-2; relTol 0; }   // with a topology changer
   shedding starts) but runs about 9x slower than PCG on one core. On a mesh that
   small the GPU has nothing to hide its latency behind; it pays off at hundreds of
   thousands of cells and up, as for the coupled solver.
+
+## Smoother, configuration and robustness
+
+- `amgxSmoother GS` (the default since 2026-11-28) is multicolour Gauss-Seidel, relaxation 0.9,
+  two pre- and post-sweeps. `amgxSmoother DILU` is the earlier multicolour DILU with one sweep.
+  GS converged a stretched (aspect ratio ~10) micro-channel conjugate case on which DILU ran every
+  linear solve to `maxLinearIter` and diverged (FoamWin #4). On the isotropic cases it costs 5-10 %:
+  the 2.1M-cell duct took 52.3 s against 49.7 s, the 80k-cell conjugate duct 5.4 s against 5.0 s,
+  with the same iteration counts. The same key sets the scalar (`solver AmgX;`) and conjugate solves
+  (`conjugateSmoother` overrides it for the conjugate one).
+- `amgxConfig "..."` replaces the whole built-in configuration (an AmgX config string, outer scope
+  `main`), for the coupled system (in `COUPLED`) or a scalar equation (in its `solvers` entry):
+
+  ```c++
+  amgxConfig "config_version=2, exception_handling=1, main:convergence=RELATIVE_INI_CORE, main:norm=L2, main:monitor_residual=1, main:print_solve_stats=0, solver(main)=PBICGSTAB, main:preconditioner(amg)=AMG, amg:algorithm=AGGREGATION, amg:selector=SIZE_2, amg:smoother(sm)=MULTICOLOR_GS, sm:relaxation_factor=0.9, amg:presweeps=2, amg:postsweeps=2, amg:max_iters=1, amg:cycle=V, amg:max_levels=50, amg:coarse_solver=DENSE_LU_SOLVER, amg:dense_lu_num_rows=64, amg:min_coarse_rows=32";
+  ```
+
+- A non-finite solution from any AmgX solve stops the run at once with what to try, instead of
+  failing later inside AmgX ("solver_resetup failed: Internal error").
+- `amgxPrecision mixed` is refused: with AmgX 2.5 the mixed (dDFI) mode failed inside AmgX on every
+  case tried (a floating-point exception in its convergence check for the block system, and
+  "Configuration feature is not implemented" for scalar systems).
+- Outer iterations: laminar ducts converge in 12-15, but cases with stretched cells, thin channels and
+  tight `residualControl` (`T 1e-6`) have needed 50-80; the integral quantities (temperatures,
+  pressure drop) stop changing well before the residual target. Monitor them, or loosen `T`.
+- Mid-size meshes: at ~150k cells the host side (operators, assembly, and the conjugate energy system)
+  costs more than the GPU solve, so a conjugate case there may run no faster than `foamMultiRun` on
+  4 ranks. The GPU pays off from about a million cells.
 
 ## Measured (2026-11-27)
 

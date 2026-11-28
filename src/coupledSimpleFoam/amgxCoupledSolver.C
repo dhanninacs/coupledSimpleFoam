@@ -63,8 +63,7 @@ namespace
         "main:obtain_timings=0, "
         "main:preconditioner(amg)=AMG, "
         "amg:algorithm=AGGREGATION, amg:selector=SIZE_2, "
-        "amg:smoother(sm)=MULTICOLOR_DILU, sm:relaxation_factor=1.0, "
-        "amg:presweeps=1, amg:postsweeps=1, amg:max_iters=1, "
+        "@SMOOTHER@, amg:max_iters=1, "
         "amg:cycle=V, amg:max_levels=50, "
         "amg:coarse_solver=DENSE_LU_SOLVER, amg:dense_lu_num_rows=64, "
         "amg:min_coarse_rows=32, amg:print_grid_stats=0";
@@ -82,7 +81,19 @@ Foam::amgxCoupledSolver::amgxCoupledSolver(const dictionary& dict)
     reuse_(dict.lookupOrDefault<word>("amgxReuse", "resetup")),
     mixed_(dict.lookupOrDefault<word>("amgxPrecision", "double") == "mixed"),
     verbose_(dict.lookupOrDefault<bool>("amgxVerbose", false)),
-    config_(dict.lookupOrDefault<string>("amgxConfig", string(defaultConfig))),
+    config_
+    (
+        dict.found("amgxConfig")
+      ? dict.lookup<string>("amgxConfig")
+      : string
+            (
+                std::string(defaultConfig).replace
+                (
+                    std::string(defaultConfig).find("@SMOOTHER@"), 10,
+                    amgxCommon::smootherConfig(dict.lookupOrDefault<word>("amgxSmoother", "GS"))
+                )
+            )
+    ),
     rsrc_(nullptr),
     cfg_(nullptr),
     solverCfg_(nullptr),
@@ -95,6 +106,15 @@ Foam::amgxCoupledSolver::amgxCoupledSolver(const dictionary& dict)
     nSolves_(0),
     uploaded_(false)
 {
+    if (mixed_)
+    {
+        FatalErrorInFunction
+            << "amgxPrecision mixed is not available: with AmgX 2.5 the mixed (dDFI) "
+                << "mode fails inside AmgX (a floating-point exception in its convergence "
+                << "check, or \"Configuration feature is not implemented\") on the cases "
+                << "tested. Use amgxPrecision double (the default)."
+            << exit(FatalError);
+    }
     if (Pstream::parRun())
     {
         FatalErrorInFunction
@@ -419,10 +439,13 @@ Foam::label Foam::amgxCoupledSolver::solve
     {
         WarningInFunction
             << "AmgX solve did not converge (status " << int(status)
-            << ") after " << its << " iterations" << endl;
+            << ") after " << its << " iterations"
+            << (its >= maxIter_ ? " (maxLinearIter); on a stretched mesh try amgxSmoother GS" : "")
+            << endl;
     }
 
     check(AMGX_vector_download(s, x.data()), "vector_download");
+    amgxCommon::checkFinite(x.cdata(), x.size(), "the coupled p-U system");
     const auto t4 = clock::now();
 
     auto sec = [](clock::time_point a, clock::time_point b)

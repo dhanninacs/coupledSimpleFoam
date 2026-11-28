@@ -64,8 +64,7 @@ namespace
         "main:monitor_residual=1, main:print_solve_stats=0, "
         "main:preconditioner(amg)=AMG, "
         "amg:algorithm=AGGREGATION, amg:selector=SIZE_2, "
-        "amg:smoother(sm)=MULTICOLOR_DILU, sm:relaxation_factor=1.0, "
-        "amg:presweeps=1, amg:postsweeps=1, amg:max_iters=1, "
+        "@SMOOTHER@, amg:max_iters=1, "
         "amg:cycle=V, amg:max_levels=50, "
         "amg:coarse_solver=DENSE_LU_SOLVER, amg:dense_lu_num_rows=64, "
         "amg:min_coarse_rows=32";
@@ -109,6 +108,14 @@ Foam::conjugateEnergy::conjugateEnergy
     solverName_(coupledDict.lookupOrDefault<word>("conjugateSolver", "Eigen")),
     tolerance_(coupledDict.lookupOrDefault<scalar>("conjugateTolerance", 1e-10)),
     maxIter_(coupledDict.lookupOrDefault<label>("conjugateMaxIter", 1000)),
+    smoother_
+    (
+        coupledDict.lookupOrDefault<word>
+        (
+            "conjugateSmoother",
+            coupledDict.lookupOrDefault<word>("amgxSmoother", "GS")
+        )
+    ),
     n_(0),
     patternBuilt_(false),
     amgx_(nullptr)
@@ -587,7 +594,9 @@ Foam::label Foam::conjugateEnergy::solveSystem(scalar initialResidual, scalar no
         std::min(scalar(0.1), 0.5*target/std::max(initialResidual, scalar(vSmall)));
     std::ostringstream full;
     full.precision(6);
-    full << conjugateConfig << ", main:tolerance=" << amgxTol
+    std::string cfgText(conjugateConfig);
+    cfgText.replace(cfgText.find("@SMOOTHER@"), 10, amgxCommon::smootherConfig(smoother_));
+    full << cfgText << ", main:tolerance=" << amgxTol
          << ", main:max_iters=" << maxIter_;
     AMGX_config_handle cfg;
     amgxCommon::check(AMGX_config_create(&cfg, full.str().c_str()), "config_create");
@@ -602,6 +611,7 @@ Foam::label Foam::conjugateEnergy::solveSystem(scalar initialResidual, scalar no
     int its = 0;
     AMGX_solver_get_iterations_number(slv, &its);
     amgxCommon::check(AMGX_vector_download(st->x, x_.data()), "vector_download");
+    amgxCommon::checkFinite(x_.data(), label(x_.size()), "the conjugate temperature");
     AMGX_solver_destroy(slv);
     AMGX_config_destroy(cfg);
     return label(its);
